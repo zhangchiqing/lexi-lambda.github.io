@@ -1,0 +1,1152 @@
+<?xml version="1.0" encoding="utf-8"?> 
+<rss version="2.0">
+ <channel>
+  <title>Alexis King's Blog: Posts tagged 'macros'</title>
+  <description>Alexis King's Blog: Posts tagged 'macros'</description>
+  <link>http://lexi-lambda.github.io/tags/macros.html</link>
+  <lastBuildDate>Sat, 12 Aug 2017 16:26:05 UT</lastBuildDate>
+  <pubDate>Sat, 12 Aug 2017 16:26:05 UT</pubDate>
+  <ttl>1800</ttl>
+  <item>
+   <title>User-programmable infix operators in Racket</title>
+   <link>http://lexi-lambda.github.io/blog/2017/08/12/user-programmable-infix-operators-in-racket?utm_source=macros&amp;utm_medium=RSS</link>
+   <guid isPermaLink="false">urn:http-lexi-lambda-github-io:-blog-2017-08-12-user-programmable-infix-operators-in-racket</guid>
+   <pubDate>Sat, 12 Aug 2017 16:26:05 UT</pubDate>
+   <author>Alexis King</author>
+   <description>
+&lt;p&gt;Lisps are not known for infix operators, quite the opposite; infix operators generally involve more syntax and parsing than Lispers are keen to support. However, in &lt;a href="https://github.com/lexi-lambda/hackett"&gt;Hackett&lt;/a&gt;, all functions are curried, and variable-arity functions do not exist. Infix operators are almost necessary for that to be palatable, and though there are other reasons to want them, it may not be obvious how to support them without making the reader considerably more complex.&lt;/p&gt;
+
+&lt;p&gt;Fortunately, if we require users to syntactically specify where they wish to use infix expressions, support for infix operators is not only possible, but can support be done &lt;em&gt;without&lt;/em&gt; modifying the stock &lt;code&gt;#lang racket&lt;/code&gt; reader. Futhermore, the resulting technique makes it possible for fixity information to be specified locally in a way that cooperates nicely with the Racket macro system, allowing the parsing of infix expressions to be manipulated at compile-time by users’ macros.&lt;/p&gt;
+&lt;!-- more--&gt;
+
+&lt;h1 id="our-mission"&gt;Our mission&lt;/h1&gt;
+
+&lt;p&gt;Before we embark, let’s clarify our goal. We want to support infix operators in Racket, of course, but that could mean a lot of different things! Let’s start with what we &lt;em&gt;do&lt;/em&gt; want:&lt;/p&gt;
+
+&lt;ul&gt;
+ &lt;li&gt;
+  &lt;p&gt;Infix operators should be user-extensible, not limited to a special set of built-in operators.&lt;/p&gt;&lt;/li&gt;
+ &lt;li&gt;
+  &lt;p&gt;Furthermore, operators’ names should not be restricted to a separate “operator” character set. Any valid Lisp identifier should be usable as an infix operator.&lt;/p&gt;&lt;/li&gt;
+ &lt;li&gt;
+  &lt;p&gt;We want to be able to support fixity/associativity annotations. Some operators should associate to the left, like subtraction, but others should associate to the right, like &lt;code&gt;cons&lt;/code&gt;. This allows &lt;code&gt;5 - 1 - 2&lt;/code&gt; to be parsed as &lt;code&gt;(- (- 5 1) 2)&lt;/code&gt;, but &lt;code&gt;5 :: 1 :: nil&lt;/code&gt; to be parsed as &lt;code&gt;(:: 5 (:: 1 nil))&lt;/code&gt;.&lt;/p&gt;&lt;/li&gt;&lt;/ul&gt;
+
+&lt;p&gt;These are nice goals, but we also won’t be too ambitious. In order to keep things simple and achievable, we’ll keep the following restrictions:&lt;/p&gt;
+
+&lt;ul&gt;
+ &lt;li&gt;
+  &lt;p&gt;We will &lt;strong&gt;not&lt;/strong&gt; permit infix expressions in arbitrary locations, since that would be impossible to parse given how we want to allow users to pick any names for operators they wish. Instead, infix expressions must be wrapped in curly braces, e.g. replacing &lt;code&gt;(+ 1 2)&lt;/code&gt; with &lt;code&gt;{1 + 2}&lt;/code&gt;.&lt;/p&gt;&lt;/li&gt;
+ &lt;li&gt;
+  &lt;p&gt;Our implementation will &lt;strong&gt;not&lt;/strong&gt; support any notion of operator precedence; all operators will have equal precedence, and it will be illegal to mix operators of different associativity in the same expression. Precedence is entirely possible to implement in theory, but it would be considerably more work, so this blog post does not include it.&lt;/p&gt;&lt;/li&gt;
+ &lt;li&gt;
+  &lt;p&gt;All operators will be binary, and we will &lt;strong&gt;not&lt;/strong&gt; support unary or mixfix operators. My intuition is that this technique should be able to be generalized to both of those things, but it would be considerably more complicated.&lt;/p&gt;&lt;/li&gt;&lt;/ul&gt;
+
+&lt;p&gt;With those points in mind, what would the interface for our infix operator library look like for our users? Ideally, something like this:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="kn"&gt;#lang &lt;/span&gt;&lt;span class="nn"&gt;racket&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;require&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;prefix-in&lt;/span&gt; &lt;span class="n"&gt;racket/base/&lt;/span&gt; &lt;span class="n"&gt;racket/base&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+         &lt;span class="s2"&gt;"infix.rkt"&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-infix-operator&lt;/span&gt; &lt;span class="nb"&gt;-&lt;/span&gt; &lt;span class="n"&gt;racket/base/-&lt;/span&gt; &lt;span class="kd"&gt;#:fixity&lt;/span&gt; &lt;span class="n"&gt;left&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-infix-operator&lt;/span&gt; &lt;span class="n"&gt;::&lt;/span&gt; &lt;span class="nb"&gt;cons&lt;/span&gt; &lt;span class="kd"&gt;#:fixity&lt;/span&gt; &lt;span class="n"&gt;right&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+
+&lt;span class="p"&gt;{{&lt;/span&gt;&lt;span class="mi"&gt;2&lt;/span&gt; &lt;span class="nb"&gt;-&lt;/span&gt; &lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;}&lt;/span&gt; &lt;span class="n"&gt;::&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;&lt;span class="mi"&gt;10&lt;/span&gt; &lt;span class="nb"&gt;-&lt;/span&gt; &lt;span class="mi"&gt;3&lt;/span&gt;&lt;span class="p"&gt;}&lt;/span&gt; &lt;span class="n"&gt;::&lt;/span&gt; &lt;span class="o"&gt;&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;()}&lt;/span&gt;
+&lt;span class="c1"&gt;; =&amp;gt; &amp;#39;(1 7)&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;Let’s get started.&lt;/p&gt;
+
+&lt;h1 id="implementing-infix-operators"&gt;Implementing infix operators&lt;/h1&gt;
+
+&lt;p&gt;Now that we know what we want, how do we get there? Well, there are a few pieces to this puzzle. We’ll need to solve a two main problems:&lt;/p&gt;
+
+&lt;ol&gt;
+ &lt;li&gt;
+  &lt;p&gt;How do we “hook into” expressions wrapped with curly braces so that we can perform a desugaring pass?&lt;/p&gt;&lt;/li&gt;
+ &lt;li&gt;
+  &lt;p&gt;How can we associate fixity information with certain operators?&lt;/p&gt;&lt;/li&gt;&lt;/ol&gt;
+
+&lt;p&gt;We’ll start by tackling the first problem, since its solution will inform the answer to the second. Since we won’t have any fixity information to start with, we’ll just assume that all operators associate left by default.&lt;/p&gt;
+
+&lt;p&gt;So, how &lt;em&gt;do&lt;/em&gt; we detect if a Racket expression is surrounded by curly braces? Normally, in &lt;code&gt;#lang racket&lt;/code&gt;, parentheses, square brackets, and curly braces are all interchangeable. Indeed, if you use curly braces in the REPL, you will find that they are treated &lt;em&gt;exactly&lt;/em&gt; the same as parentheses:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="nb"&gt;&amp;gt;&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;&lt;span class="nb"&gt;+&lt;/span&gt; &lt;span class="mi"&gt;1&lt;/span&gt; &lt;span class="mi"&gt;2&lt;/span&gt;&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;span class="mi"&gt;3&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;If they are treated identically, giving them special behavior might seem hopeless, but don’t despair! Racket is no ordinary programming language, and it provides some tools to help us out here.&lt;/p&gt;
+
+&lt;p&gt;Someone who has worked with Lisps before is likely already aware that Lisp source code is a very direct representation of its AST, composed mostly of lists, pairs, symbols, numbers, and strings. In Racket, this is also true, but Racket also wraps these datums in boxes known as &lt;a href="http://docs.racket-lang.org/reference/syntax-model.html#%28tech._syntax._object%29"&gt;&lt;em&gt;syntax objects&lt;/em&gt;&lt;/a&gt;. Syntax objects contain extra metadata about the code, most notably its lexical context, necessary for Racket’s hygiene system. However, syntax objects can also contain arbitrary metadata, known as &lt;a href="http://docs.racket-lang.org/reference/stxprops.html#%28tech._syntax._property%29"&gt;&lt;em&gt;syntax properties&lt;/em&gt;&lt;/a&gt;. Macros can attach arbitrary values to the syntax objects they produce using syntax properties, and other macros can inspect them. Racket’s &lt;a href="http://docs.racket-lang.org/guide/Pairs__Lists__and_Racket_Syntax.html#%28tech._reader%29"&gt;&lt;em&gt;reader&lt;/em&gt;&lt;/a&gt; (the syntax parser that turns program text into Racket syntax objects) also attaches certain syntax properties as part of its parsing process. One of those is named &lt;a href="http://docs.racket-lang.org/reference/reader.html#%28idx._%28gentag._30._%28lib._scribblings%2Freference%2Freference..scrbl%29%29%29"&gt;&lt;code&gt;'paren-shape&lt;/code&gt;&lt;/a&gt;.&lt;/p&gt;
+
+&lt;p&gt;This syntax property, as the name implies, keeps track of the shape of parentheses in syntax objects. You can see that for yourself by inspecting the property’s value for different syntax objects in the REPL:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="nb"&gt;&amp;gt;&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;syntax-property&lt;/span&gt; &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt; &lt;span class="mi"&gt;2&lt;/span&gt; &lt;span class="mi"&gt;3&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="o"&gt;&amp;#39;&lt;/span&gt;&lt;span class="ss"&gt;paren-shape&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;span class="no"&gt;#f&lt;/span&gt;
+&lt;span class="nb"&gt;&amp;gt;&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;syntax-property&lt;/span&gt; &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt; &lt;span class="mi"&gt;2&lt;/span&gt; &lt;span class="mi"&gt;3&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt; &lt;span class="o"&gt;&amp;#39;&lt;/span&gt;&lt;span class="ss"&gt;paren-shape&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;span class="sc"&gt;#\[&lt;/span&gt;
+&lt;span class="nb"&gt;&amp;gt;&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;syntax-property&lt;/span&gt; &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;{&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt; &lt;span class="mi"&gt;2&lt;/span&gt; &lt;span class="mi"&gt;3&lt;/span&gt;&lt;span class="p"&gt;}&lt;/span&gt; &lt;span class="o"&gt;&amp;#39;&lt;/span&gt;&lt;span class="ss"&gt;paren-shape&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;span class="sc"&gt;#\{&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;This syntax property gives us the capability to distinguish between syntax objects that use curly braces and those that don’t, which is a step in the right direction, but it still doesn’t give us any hook with which we can change the behavior of certain expressions. Fortunately, there’s something else that can.&lt;/p&gt;
+
+&lt;h2 id="customizing-application"&gt;Customizing application&lt;/h2&gt;
+
+&lt;p&gt;Racket is a language &lt;em&gt;designed&lt;/em&gt; to be extended, and it provides a variety of hooks in the language for the purposes of tweaking pieces in minor ways. One such hook is named &lt;a href="http://docs.racket-lang.org/reference/application.html#%28form._%28%28lib._racket%2Fprivate%2Fbase..rkt%29._~23~25app%29%29"&gt;&lt;code&gt;#%app&lt;/code&gt;&lt;/a&gt;, which is automatically introduced by the macroexpander whenever it encounters a function application. That means it effectively turns this:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;+&lt;/span&gt; &lt;span class="mi"&gt;1&lt;/span&gt; &lt;span class="mi"&gt;2&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;…into this:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;#%app&lt;/span&gt; &lt;span class="nb"&gt;+&lt;/span&gt; &lt;span class="mi"&gt;1&lt;/span&gt; &lt;span class="mi"&gt;2&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;What’s special about &lt;code&gt;#%app&lt;/code&gt; is that the macroexpander will use whichever &lt;code&gt;#%app&lt;/code&gt; is in scope in the expression’s lexical context, so if we write our own version of &lt;code&gt;#%app&lt;/code&gt;, it will be used instead of the one from &lt;code&gt;#lang racket&lt;/code&gt;. This is what we will use to hook into ordinary Racket expressions.&lt;/p&gt;
+
+&lt;p&gt;To write our custom version of &lt;code&gt;#%app&lt;/code&gt;, we will use the usual tool: Racket’s industrial-strength macro-authoring DSL, &lt;a href="http://docs.racket-lang.org/syntax/stxparse.html"&gt;&lt;code&gt;syntax/parse&lt;/code&gt;&lt;/a&gt;. We’ll also use a helper library that provides some tools for pattern-matching on syntax objects with the &lt;code&gt;'paren-shape&lt;/code&gt; syntax property, &lt;a href="http://docs.racket-lang.org/syntax-classes/index.html#%28mod-path._syntax%2Fparse%2Fclass%2Fparen-shape%29"&gt;&lt;code&gt;syntax/parse/class/paren-shape&lt;/code&gt;&lt;/a&gt;. Using these, we can transform expressions that are surrounded in curly braces differently from how we would transform expressions surrounded by parentheses:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="kn"&gt;#lang &lt;/span&gt;&lt;span class="nn"&gt;racket&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;require&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;for-syntax&lt;/span&gt; &lt;span class="n"&gt;syntax/parse/class/paren-shape&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+         &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;prefix-in&lt;/span&gt; &lt;span class="n"&gt;racket/base/&lt;/span&gt; &lt;span class="n"&gt;racket/base&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+         &lt;span class="n"&gt;syntax/parse/define&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-syntax-parser&lt;/span&gt; &lt;span class="k"&gt;#%app&lt;/span&gt;
+  &lt;span class="p"&gt;[{&lt;/span&gt;&lt;span class="n"&gt;~braces&lt;/span&gt; &lt;span class="k"&gt;_&lt;/span&gt; &lt;span class="n"&gt;arg&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;}&lt;/span&gt;
+   &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;#%infix&lt;/span&gt; &lt;span class="n"&gt;arg&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)]&lt;/span&gt;
+  &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="k"&gt;_&lt;/span&gt; &lt;span class="n"&gt;arg&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+   &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;racket/base/#%app&lt;/span&gt; &lt;span class="n"&gt;arg&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)])&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;This code will transform any applications surrounded in curly braces into one that starts with &lt;code&gt;#%infix&lt;/code&gt; instead of &lt;code&gt;#%app&lt;/code&gt;, so &lt;code&gt;{1 + 2}&lt;/code&gt; will become &lt;code&gt;(#%infix 1 + 2)&lt;/code&gt;, for example. The identifier &lt;code&gt;#%infix&lt;/code&gt; isn’t actually special in any way, it just has a funny name, but we haven’t actually defined &lt;code&gt;#%infix&lt;/code&gt; yet, so we need to do that next!&lt;/p&gt;
+
+&lt;p&gt;To start, we’ll just handle the simplest case: infix expressions with precisely three subexpressions, like &lt;code&gt;{1 + 2}&lt;/code&gt;, should be converted into the equivalent prefix expressions, in this case &lt;code&gt;(+ 1 2)&lt;/code&gt;. We can do this with a simple macro:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-syntax-parser&lt;/span&gt; &lt;span class="n"&gt;#%infix&lt;/span&gt;
+  &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="k"&gt;_&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt; &lt;span class="n"&gt;op&lt;/span&gt; &lt;span class="n"&gt;b&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+   &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;racket/base/#%app&lt;/span&gt; &lt;span class="n"&gt;op&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt; &lt;span class="n"&gt;b&lt;/span&gt;&lt;span class="p"&gt;)])&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;Due to the way Racket propagates syntax properties, we explicitly indicate that the resulting expansion should use the &lt;code&gt;#%app&lt;/code&gt; from &lt;code&gt;racket/base&lt;/code&gt;, which will avoid any accidental infinite recursion between our &lt;code&gt;#%app&lt;/code&gt; and &lt;code&gt;#%infix&lt;/code&gt;. With this in place, we can now try our code out in the REPL, and believe it or not, we now support infix expressions with just those few lines of code:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="nb"&gt;&amp;gt;&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;+&lt;/span&gt; &lt;span class="mi"&gt;1&lt;/span&gt; &lt;span class="mi"&gt;2&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;span class="mi"&gt;3&lt;/span&gt;
+&lt;span class="nb"&gt;&amp;gt;&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt; &lt;span class="nb"&gt;+&lt;/span&gt; &lt;span class="mi"&gt;2&lt;/span&gt;&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;span class="mi"&gt;3&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;That’s pretty cool!&lt;/p&gt;
+
+&lt;p&gt;Of course, we probably want to support infix applications with more than just a single binary operator, such as &lt;code&gt;{1 + 2 + 3}&lt;/code&gt;. We can implement that just by adding another case to &lt;code&gt;#%infix&lt;/code&gt; that handles more subforms:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-syntax-parser&lt;/span&gt; &lt;span class="n"&gt;#%infix&lt;/span&gt;
+  &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="k"&gt;_&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt; &lt;span class="n"&gt;op&lt;/span&gt; &lt;span class="n"&gt;b&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+   &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;racket/base/#%app&lt;/span&gt; &lt;span class="n"&gt;op&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt; &lt;span class="n"&gt;b&lt;/span&gt;&lt;span class="p"&gt;)]&lt;/span&gt;
+  &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="k"&gt;_&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt; &lt;span class="n"&gt;op&lt;/span&gt; &lt;span class="n"&gt;b&lt;/span&gt; &lt;span class="n"&gt;more&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+   &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;#%infix&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;#%infix&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt; &lt;span class="n"&gt;op&lt;/span&gt; &lt;span class="n"&gt;b&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="n"&gt;more&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)])&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;…and now, just by adding those two lines, we support arbitrarily-large sequences of infix operators:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="nb"&gt;&amp;gt;&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt; &lt;span class="nb"&gt;+&lt;/span&gt; &lt;span class="mi"&gt;2&lt;/span&gt; &lt;span class="nb"&gt;+&lt;/span&gt; &lt;span class="mi"&gt;3&lt;/span&gt;&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;span class="mi"&gt;6&lt;/span&gt;
+&lt;span class="nb"&gt;&amp;gt;&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt; &lt;span class="nb"&gt;+&lt;/span&gt; &lt;span class="mi"&gt;2&lt;/span&gt; &lt;span class="nb"&gt;+&lt;/span&gt; &lt;span class="mi"&gt;3&lt;/span&gt; &lt;span class="nb"&gt;+&lt;/span&gt; &lt;span class="mi"&gt;4&lt;/span&gt;&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;span class="mi"&gt;10&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;I don’t know about you, but I think being able to do this in less than 20 lines of code is pretty awesome. We can even mix different operators in the same expression:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="nb"&gt;&amp;gt;&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt; &lt;span class="nb"&gt;+&lt;/span&gt; &lt;span class="mi"&gt;2&lt;/span&gt; &lt;span class="nb"&gt;*&lt;/span&gt; &lt;span class="mi"&gt;3&lt;/span&gt; &lt;span class="nb"&gt;-&lt;/span&gt; &lt;span class="mi"&gt;4&lt;/span&gt;&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;span class="mi"&gt;5&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;Of course, all of our infix expressions currently assume that all operators associate left, as was our plan. In general, though, there are lots of useful operators that associate right, such as &lt;code&gt;cons&lt;/code&gt;, nested &lt;code&gt;-&amp;gt;&lt;/code&gt; types or contracts for curried functions, and &lt;code&gt;expt&lt;/code&gt;, the exponentiation operator.&lt;/p&gt;
+
+&lt;h2 id="tracking-operator-fixity"&gt;Tracking operator fixity&lt;/h2&gt;
+
+&lt;p&gt;Clearly, we need some way to associate operator fixity with certain identifiers, and we need to be able to do it at compile-time. Fortunately, Racket has a very robust mechanism for creating compile-time values. Unfortunately, simply associating metadata with an identifier is a little less convenient than it could be, but there is a general technique that can be done with little boilerplate.&lt;/p&gt;
+
+&lt;p&gt;Essentially, Racket (like Scheme) uses a &lt;code&gt;define-syntax&lt;/code&gt; form to define macros, which is what &lt;code&gt;define-syntax-parser&lt;/code&gt; eventually expands into. However, unlike Scheme, Racket’s &lt;code&gt;define-syntax&lt;/code&gt; is not &lt;em&gt;just&lt;/em&gt; for defining macros—it’s for defining arbitrary bindings with compile-time (aka “phase 1”) values. Using this, we can define bindings that have entirely arbitrary values at compile-time, including plain data like numbers or strings:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;define-syntax&lt;/span&gt; &lt;span class="n"&gt;foo&lt;/span&gt; &lt;span class="mi"&gt;3&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;Once a binding has been defined using &lt;code&gt;define-syntax&lt;/code&gt;, a macro can look up the value associated with it by using the &lt;a href="http://docs.racket-lang.org/reference/stxtrans.html#%28def._%28%28quote._~23~25kernel%29._syntax-local-value%29%29"&gt;&lt;code&gt;syntax-local-value&lt;/code&gt;&lt;/a&gt; function, which returns the compile-time value associated with an identifier:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;begin-for-syntax&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;println&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;syntax-local-value&lt;/span&gt; &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="n"&gt;foo&lt;/span&gt;&lt;span class="p"&gt;)))&lt;/span&gt;
+&lt;span class="c1"&gt;; =&amp;gt; 3&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;The cool thing is that &lt;code&gt;syntax-local-value&lt;/code&gt; gets the value associated with a specific &lt;em&gt;binding&lt;/em&gt;, not a specific name. This means a macro can look up the compile-time value associated with an identifier provided to it as a subform. This is close to what we want, since we could use &lt;code&gt;syntax-local-value&lt;/code&gt; to look up something associated with our infix operator bindings, but the trouble is that they would then cease to be usable as ordinary functions. For example, if you try and use the &lt;code&gt;foo&lt;/code&gt; binding from the above example as an expression, Racket will complain about an “illegal use of syntax”, which makes sense, because &lt;code&gt;foo&lt;/code&gt; is not bound to anything at runtime.&lt;/p&gt;
+
+&lt;p&gt;To solve this problem, we can use something of a trick: any compile-time binding that happens to have a procedure as its value will be treated like a macro—that is, using it as an expression will cause the macroexpander to invoke the procedure with a syntax object representing the macro invocation, and the procedure is expected to produce a new syntax object as output. Additionally, Racket programmers can make custom datatypes valid procedures by using the &lt;a href="http://docs.racket-lang.org/reference/procedures.html#%28def._%28%28lib._racket%2Fprivate%2Fbase..rkt%29._prop~3aprocedure%29%29"&gt;&lt;code&gt;prop:procedure&lt;/code&gt;&lt;/a&gt; structure type property.&lt;/p&gt;
+
+&lt;p&gt;If you are not familiar with the Racket macro system, this probably sounds rather complicated, but in practice, it’s not as confusing as it might seem. The trick here is to create a custom structure type at compile-time that we can use to track operator fixity alongside its runtime binding:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;require&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;for-syntax&lt;/span&gt; &lt;span class="n"&gt;syntax/transformer&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;begin-for-syntax&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;struct&lt;/span&gt; &lt;span class="n"&gt;infix-operator&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;runtime-binding&lt;/span&gt; &lt;span class="n"&gt;fixity&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+    &lt;span class="kd"&gt;#:property&lt;/span&gt; &lt;span class="nb"&gt;prop:procedure&lt;/span&gt;
+    &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;λ&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;operator&lt;/span&gt; &lt;span class="n"&gt;stx&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+      &lt;span class="p"&gt;((&lt;/span&gt;&lt;span class="nb"&gt;set!-transformer-procedure&lt;/span&gt;
+        &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;make-variable-like-transformer&lt;/span&gt;
+         &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;infix-operator-runtime-binding&lt;/span&gt; &lt;span class="n"&gt;operator&lt;/span&gt;&lt;span class="p"&gt;)))&lt;/span&gt;
+       &lt;span class="n"&gt;stx&lt;/span&gt;&lt;span class="p"&gt;))))&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;This is quite the magical incantation, and all the details of what is going on here are outside the scope of this blog post. Essentially, though, we can use values of this structure as a compile-time binding that will act just like the identifier provided for &lt;code&gt;runtime-binding&lt;/code&gt;, but we can also include a value of our choosing for &lt;code&gt;fixity&lt;/code&gt;. Here’s an example:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;define-syntax&lt;/span&gt; &lt;span class="n"&gt;::&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;infix-operator&lt;/span&gt; &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="nb"&gt;cons&lt;/span&gt; &lt;span class="o"&gt;&amp;#39;&lt;/span&gt;&lt;span class="ss"&gt;right&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;This new &lt;code&gt;::&lt;/code&gt; binding will act, in every way, just like &lt;code&gt;cons&lt;/code&gt;. If we use it in the REPL, you can see that it acts exactly the same:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="nb"&gt;&amp;gt;&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;::&lt;/span&gt; &lt;span class="mi"&gt;1&lt;/span&gt; &lt;span class="o"&gt;&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;())&lt;/span&gt;
+&lt;span class="o"&gt;&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;However, we can also use &lt;code&gt;syntax-local-value&lt;/code&gt; to extract this binding’s fixity at compile-time, and that’s what makes it interesting:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;begin-for-syntax&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;println&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;infix-operator-fixity&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;syntax-local-value&lt;/span&gt; &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="n"&gt;::&lt;/span&gt;&lt;span class="p"&gt;))))&lt;/span&gt;
+&lt;span class="c1"&gt;; =&amp;gt; &amp;#39;right&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;Using this extra compile-time information, we can adjust our &lt;code&gt;#%infix&lt;/code&gt; macro to inspect bindings and determine their fixity, then use that to make decisions about parsing. Just like we used &lt;code&gt;syntax/parse/class/paren-shape&lt;/code&gt; to make decisions based on the &lt;code&gt;'paren-shape&lt;/code&gt; syntax property, we can use &lt;a href="http://docs.racket-lang.org/syntax-classes/index.html#%28mod-path._syntax%2Fparse%2Fclass%2Flocal-value%29"&gt;&lt;code&gt;syntax/parse/class/local-value&lt;/code&gt;&lt;/a&gt; to pattern-match on bindings with a particular compile-time value. We’ll wrap this in a syntax class of our own to make the code easier to read:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;begin-for-syntax&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-syntax-class&lt;/span&gt; &lt;span class="n"&gt;infix-op&lt;/span&gt;
+    &lt;span class="kd"&gt;#:description&lt;/span&gt; &lt;span class="s2"&gt;"infix operator"&lt;/span&gt;
+    &lt;span class="kd"&gt;#:attributes&lt;/span&gt; &lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;fixity&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt;
+    &lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;pattern&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;&lt;span class="n"&gt;~var&lt;/span&gt; &lt;span class="n"&gt;op&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;local-value&lt;/span&gt; &lt;span class="n"&gt;infix-operator?&lt;/span&gt;&lt;span class="p"&gt;)}&lt;/span&gt;
+             &lt;span class="kd"&gt;#:attr&lt;/span&gt; &lt;span class="n"&gt;fixity&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;infix-operator-fixity&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;attribute&lt;/span&gt; &lt;span class="n"&gt;op.local-value&lt;/span&gt;&lt;span class="p"&gt;))]))&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;Now, we can update &lt;code&gt;#%infix&lt;/code&gt; to use our new &lt;code&gt;infix-op&lt;/code&gt; syntax class:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-syntax-parser&lt;/span&gt; &lt;span class="n"&gt;#%infix&lt;/span&gt;
+  &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="k"&gt;_&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt; &lt;span class="n"&gt;op:infix-op&lt;/span&gt; &lt;span class="n"&gt;b&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+   &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;racket/base/#%app&lt;/span&gt; &lt;span class="n"&gt;op&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt; &lt;span class="n"&gt;b&lt;/span&gt;&lt;span class="p"&gt;)]&lt;/span&gt;
+  &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="k"&gt;_&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt; &lt;span class="n"&gt;op:infix-op&lt;/span&gt; &lt;span class="n"&gt;b&lt;/span&gt; &lt;span class="n"&gt;more&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+   &lt;span class="kd"&gt;#:when&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;eq?&lt;/span&gt; &lt;span class="o"&gt;&amp;#39;&lt;/span&gt;&lt;span class="ss"&gt;left&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;attribute&lt;/span&gt; &lt;span class="n"&gt;op.fixity&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+   &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;#%infix&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;#%infix&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt; &lt;span class="n"&gt;op&lt;/span&gt; &lt;span class="n"&gt;b&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="n"&gt;more&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)]&lt;/span&gt;
+  &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="k"&gt;_&lt;/span&gt; &lt;span class="n"&gt;more&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt; &lt;span class="n"&gt;op:infix-op&lt;/span&gt; &lt;span class="n"&gt;b&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+   &lt;span class="kd"&gt;#:when&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;eq?&lt;/span&gt; &lt;span class="o"&gt;&amp;#39;&lt;/span&gt;&lt;span class="ss"&gt;right&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;attribute&lt;/span&gt; &lt;span class="n"&gt;op.fixity&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+   &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;#%infix&lt;/span&gt; &lt;span class="n"&gt;more&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;#%infix&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt; &lt;span class="n"&gt;op&lt;/span&gt; &lt;span class="n"&gt;b&lt;/span&gt;&lt;span class="p"&gt;))])&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;Notably, we now require all operators to be bound to compile-time infix operator values, and we include two conditions via &lt;code&gt;#:when&lt;/code&gt; clauses. These clauses check to ensure that the operator in question has the expected fixity before committing to that clause; if the condition fails, then parsing backtracks. Using this new definition of &lt;code&gt;#%infix&lt;/code&gt;, we can successfully use &lt;code&gt;::&lt;/code&gt; in an infix expression, and it will be parsed with the associativity that we expect:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="nb"&gt;&amp;gt;&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt; &lt;span class="n"&gt;::&lt;/span&gt; &lt;span class="mi"&gt;2&lt;/span&gt; &lt;span class="n"&gt;::&lt;/span&gt; &lt;span class="mi"&gt;3&lt;/span&gt; &lt;span class="n"&gt;::&lt;/span&gt; &lt;span class="o"&gt;&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;()}&lt;/span&gt;
+&lt;span class="o"&gt;&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt; &lt;span class="mi"&gt;2&lt;/span&gt; &lt;span class="mi"&gt;3&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;Exciting!&lt;/p&gt;
+
+&lt;h2 id="a-nicer-interface-for-defining-infix-operators"&gt;A nicer interface for defining infix operators&lt;/h2&gt;
+
+&lt;p&gt;We currently have to define infix operators by explicitly using &lt;code&gt;define-syntax&lt;/code&gt;, but this is not a very good interface. Users of infix syntax probably don’t want to have to understand the internal workings of the infix operator implementation, so we just need to define one final macro to consider this done: the &lt;code&gt;define-infix-operator&lt;/code&gt; form from the example at the very beginning of this blog post.&lt;/p&gt;
+
+&lt;p&gt;Fortunately, this macro is absolutely trivial to write. In fact, we can do it in a mere three lines of code, since it’s very minor sugar over the &lt;code&gt;define-syntax&lt;/code&gt; definitions we were already writing:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-simple-macro&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-infix-operator&lt;/span&gt; &lt;span class="n"&gt;op:id&lt;/span&gt; &lt;span class="n"&gt;value:id&lt;/span&gt;
+                       &lt;span class="kd"&gt;#:fixity&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;&lt;span class="n"&gt;~and&lt;/span&gt; &lt;span class="n"&gt;fixity&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;&lt;span class="n"&gt;~or&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;&lt;span class="n"&gt;~datum&lt;/span&gt; &lt;span class="n"&gt;left&lt;/span&gt;&lt;span class="p"&gt;}&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;&lt;span class="n"&gt;~datum&lt;/span&gt; &lt;span class="n"&gt;right&lt;/span&gt;&lt;span class="p"&gt;}}})&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;define-syntax&lt;/span&gt; &lt;span class="n"&gt;op&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;infix-operator&lt;/span&gt; &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="n"&gt;value&lt;/span&gt; &lt;span class="o"&gt;&amp;#39;&lt;/span&gt;&lt;span class="ss"&gt;fixity&lt;/span&gt;&lt;span class="p"&gt;)))&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;With this in hand, we can define some infix operators with a much nicer syntax:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-infix-operator&lt;/span&gt; &lt;span class="nb"&gt;+&lt;/span&gt; &lt;span class="n"&gt;racket/base/+&lt;/span&gt; &lt;span class="kd"&gt;#:fixity&lt;/span&gt; &lt;span class="n"&gt;left&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-infix-operator&lt;/span&gt; &lt;span class="nb"&gt;-&lt;/span&gt; &lt;span class="n"&gt;racket/base/-&lt;/span&gt; &lt;span class="kd"&gt;#:fixity&lt;/span&gt; &lt;span class="n"&gt;left&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-infix-operator&lt;/span&gt; &lt;span class="nb"&gt;*&lt;/span&gt; &lt;span class="n"&gt;racket/base/*&lt;/span&gt; &lt;span class="kd"&gt;#:fixity&lt;/span&gt; &lt;span class="n"&gt;left&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-infix-operator&lt;/span&gt; &lt;span class="nb"&gt;/&lt;/span&gt; &lt;span class="n"&gt;racket/base//&lt;/span&gt; &lt;span class="kd"&gt;#:fixity&lt;/span&gt; &lt;span class="n"&gt;left&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-infix-operator&lt;/span&gt; &lt;span class="n"&gt;^&lt;/span&gt; &lt;span class="nb"&gt;expt&lt;/span&gt; &lt;span class="kd"&gt;#:fixity&lt;/span&gt; &lt;span class="n"&gt;right&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-infix-operator&lt;/span&gt; &lt;span class="n"&gt;::&lt;/span&gt; &lt;span class="nb"&gt;cons&lt;/span&gt; &lt;span class="kd"&gt;#:fixity&lt;/span&gt; &lt;span class="n"&gt;right&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;With these simple definitions, we can write some very nice mathematical expressions that use infix syntax, in ordinary &lt;code&gt;#lang racket&lt;/code&gt;:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="nb"&gt;&amp;gt;&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt; &lt;span class="nb"&gt;+&lt;/span&gt; &lt;span class="mi"&gt;2&lt;/span&gt; &lt;span class="nb"&gt;-&lt;/span&gt; &lt;span class="mi"&gt;4&lt;/span&gt;&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;span class="mi"&gt;-1&lt;/span&gt;
+&lt;span class="nb"&gt;&amp;gt;&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;&lt;span class="mi"&gt;2&lt;/span&gt; &lt;span class="n"&gt;^&lt;/span&gt; &lt;span class="mi"&gt;2&lt;/span&gt; &lt;span class="n"&gt;^&lt;/span&gt; &lt;span class="mi"&gt;3&lt;/span&gt;&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;span class="mi"&gt;256&lt;/span&gt;
+&lt;span class="nb"&gt;&amp;gt;&lt;/span&gt; &lt;span class="p"&gt;{{&lt;/span&gt;&lt;span class="mi"&gt;2&lt;/span&gt; &lt;span class="n"&gt;^&lt;/span&gt; &lt;span class="mi"&gt;2&lt;/span&gt;&lt;span class="p"&gt;}&lt;/span&gt; &lt;span class="n"&gt;^&lt;/span&gt; &lt;span class="mi"&gt;3&lt;/span&gt;&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;span class="mi"&gt;64&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;And you know what’s most amazing about this? The entire thing is &lt;strong&gt;only 50 lines of code&lt;/strong&gt;. Here is the entire implementation of infix operators from this blog post in a single code block, with absolutely nothing hidden or omitted:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="kn"&gt;#lang &lt;/span&gt;&lt;span class="nn"&gt;racket&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;require&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;for-syntax&lt;/span&gt; &lt;span class="n"&gt;syntax/parse/class/local-value&lt;/span&gt;
+                     &lt;span class="n"&gt;syntax/parse/class/paren-shape&lt;/span&gt;
+                     &lt;span class="n"&gt;syntax/transformer&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+         &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;prefix-in&lt;/span&gt; &lt;span class="n"&gt;racket/base/&lt;/span&gt; &lt;span class="n"&gt;racket/base&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+         &lt;span class="n"&gt;syntax/parse/define&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;begin-for-syntax&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;struct&lt;/span&gt; &lt;span class="n"&gt;infix-operator&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;runtime-binding&lt;/span&gt; &lt;span class="n"&gt;fixity&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+    &lt;span class="kd"&gt;#:property&lt;/span&gt; &lt;span class="nb"&gt;prop:procedure&lt;/span&gt;
+    &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;λ&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;operator&lt;/span&gt; &lt;span class="n"&gt;stx&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+      &lt;span class="p"&gt;((&lt;/span&gt;&lt;span class="nb"&gt;set!-transformer-procedure&lt;/span&gt;
+        &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;make-variable-like-transformer&lt;/span&gt;
+         &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;infix-operator-runtime-binding&lt;/span&gt; &lt;span class="n"&gt;operator&lt;/span&gt;&lt;span class="p"&gt;)))&lt;/span&gt;
+       &lt;span class="n"&gt;stx&lt;/span&gt;&lt;span class="p"&gt;)))&lt;/span&gt;
+
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-syntax-class&lt;/span&gt; &lt;span class="n"&gt;infix-op&lt;/span&gt;
+    &lt;span class="kd"&gt;#:description&lt;/span&gt; &lt;span class="s2"&gt;"infix operator"&lt;/span&gt;
+    &lt;span class="kd"&gt;#:attributes&lt;/span&gt; &lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;fixity&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt;
+    &lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;pattern&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;&lt;span class="n"&gt;~var&lt;/span&gt; &lt;span class="n"&gt;op&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;local-value&lt;/span&gt; &lt;span class="n"&gt;infix-operator?&lt;/span&gt;&lt;span class="p"&gt;)}&lt;/span&gt;
+             &lt;span class="kd"&gt;#:attr&lt;/span&gt; &lt;span class="n"&gt;fixity&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;infix-operator-fixity&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;attribute&lt;/span&gt; &lt;span class="n"&gt;op.local-value&lt;/span&gt;&lt;span class="p"&gt;))]))&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-syntax-parser&lt;/span&gt; &lt;span class="k"&gt;#%app&lt;/span&gt;
+  &lt;span class="p"&gt;[{&lt;/span&gt;&lt;span class="n"&gt;~braces&lt;/span&gt; &lt;span class="k"&gt;_&lt;/span&gt; &lt;span class="n"&gt;arg&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;}&lt;/span&gt;
+   &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;#%infix&lt;/span&gt; &lt;span class="n"&gt;arg&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)]&lt;/span&gt;
+  &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="k"&gt;_&lt;/span&gt; &lt;span class="n"&gt;arg&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+   &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;racket/base/#%app&lt;/span&gt; &lt;span class="n"&gt;arg&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)])&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-syntax-parser&lt;/span&gt; &lt;span class="n"&gt;#%infix&lt;/span&gt;
+  &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="k"&gt;_&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt; &lt;span class="n"&gt;op:infix-op&lt;/span&gt; &lt;span class="n"&gt;b&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+   &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;racket/base/#%app&lt;/span&gt; &lt;span class="n"&gt;op&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt; &lt;span class="n"&gt;b&lt;/span&gt;&lt;span class="p"&gt;)]&lt;/span&gt;
+  &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="k"&gt;_&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt; &lt;span class="n"&gt;op:infix-op&lt;/span&gt; &lt;span class="n"&gt;b&lt;/span&gt; &lt;span class="n"&gt;more&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+   &lt;span class="kd"&gt;#:when&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;eq?&lt;/span&gt; &lt;span class="o"&gt;&amp;#39;&lt;/span&gt;&lt;span class="ss"&gt;left&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;attribute&lt;/span&gt; &lt;span class="n"&gt;op.fixity&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+   &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;#%infix&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;#%infix&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt; &lt;span class="n"&gt;op&lt;/span&gt; &lt;span class="n"&gt;b&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="n"&gt;more&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)]&lt;/span&gt;
+  &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="k"&gt;_&lt;/span&gt; &lt;span class="n"&gt;more&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt; &lt;span class="n"&gt;op:infix-op&lt;/span&gt; &lt;span class="n"&gt;b&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+   &lt;span class="kd"&gt;#:when&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;eq?&lt;/span&gt; &lt;span class="o"&gt;&amp;#39;&lt;/span&gt;&lt;span class="ss"&gt;right&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;attribute&lt;/span&gt; &lt;span class="n"&gt;op.fixity&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+   &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;#%infix&lt;/span&gt; &lt;span class="n"&gt;more&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;#%infix&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt; &lt;span class="n"&gt;op&lt;/span&gt; &lt;span class="n"&gt;b&lt;/span&gt;&lt;span class="p"&gt;))])&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-simple-macro&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-infix-operator&lt;/span&gt; &lt;span class="n"&gt;op:id&lt;/span&gt; &lt;span class="n"&gt;value:id&lt;/span&gt;
+                       &lt;span class="kd"&gt;#:fixity&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;&lt;span class="n"&gt;~and&lt;/span&gt; &lt;span class="n"&gt;fixity&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;&lt;span class="n"&gt;~or&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;&lt;span class="n"&gt;~datum&lt;/span&gt; &lt;span class="n"&gt;left&lt;/span&gt;&lt;span class="p"&gt;}&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;&lt;span class="n"&gt;~datum&lt;/span&gt; &lt;span class="n"&gt;right&lt;/span&gt;&lt;span class="p"&gt;}}})&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;define-syntax&lt;/span&gt; &lt;span class="n"&gt;op&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;infix-operator&lt;/span&gt; &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="n"&gt;value&lt;/span&gt; &lt;span class="o"&gt;&amp;#39;&lt;/span&gt;&lt;span class="ss"&gt;fixity&lt;/span&gt;&lt;span class="p"&gt;)))&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-infix-operator&lt;/span&gt; &lt;span class="nb"&gt;+&lt;/span&gt; &lt;span class="n"&gt;racket/base/+&lt;/span&gt; &lt;span class="kd"&gt;#:fixity&lt;/span&gt; &lt;span class="n"&gt;left&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-infix-operator&lt;/span&gt; &lt;span class="nb"&gt;-&lt;/span&gt; &lt;span class="n"&gt;racket/base/-&lt;/span&gt; &lt;span class="kd"&gt;#:fixity&lt;/span&gt; &lt;span class="n"&gt;left&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-infix-operator&lt;/span&gt; &lt;span class="nb"&gt;*&lt;/span&gt; &lt;span class="n"&gt;racket/base/*&lt;/span&gt; &lt;span class="kd"&gt;#:fixity&lt;/span&gt; &lt;span class="n"&gt;left&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-infix-operator&lt;/span&gt; &lt;span class="nb"&gt;/&lt;/span&gt; &lt;span class="n"&gt;racket/base//&lt;/span&gt; &lt;span class="kd"&gt;#:fixity&lt;/span&gt; &lt;span class="n"&gt;left&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-infix-operator&lt;/span&gt; &lt;span class="n"&gt;^&lt;/span&gt; &lt;span class="nb"&gt;expt&lt;/span&gt; &lt;span class="kd"&gt;#:fixity&lt;/span&gt; &lt;span class="n"&gt;right&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-infix-operator&lt;/span&gt; &lt;span class="n"&gt;::&lt;/span&gt; &lt;span class="nb"&gt;cons&lt;/span&gt; &lt;span class="kd"&gt;#:fixity&lt;/span&gt; &lt;span class="n"&gt;right&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;Racket is a hell of a programming language.&lt;/p&gt;
+
+&lt;h1 id="applications-limitations-and-implications"&gt;Applications, limitations, and implications&lt;/h1&gt;
+
+&lt;p&gt;This blog post has outlined a complete, useful model for infix operators, and it is now hopefully clear how they work, but many of the most interesting properties of this implementation are probably not obvious. As far as I can make out, this embedding of infix operators into a macro system is novel, and I am &lt;em&gt;almost certain&lt;/em&gt; that the way this implementation tracks fixity information is unique. One of the most interesting capabilities gained from this choice of implementation is the ability for macros to define infix operators and control their fixity, even &lt;em&gt;locally&lt;/em&gt;.&lt;/p&gt;
+
+&lt;p&gt;What does this mean? Well, remember that infix operators are just special syntax bindings. Racket includes a variety of forms for binding or adjusting macros locally, such as &lt;code&gt;let-syntax&lt;/code&gt; and &lt;code&gt;syntax-parameterize&lt;/code&gt;. Using these tools, it would be entirely possible to implement a &lt;code&gt;with-fixity&lt;/code&gt; macro, that could adjust the fixity of an operator within a syntactic block. This could be used, for example, to make &lt;code&gt;/&lt;/code&gt; right associative within a block of code:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="nb"&gt;&amp;gt;&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt; &lt;span class="nb"&gt;/&lt;/span&gt; &lt;span class="mi"&gt;2&lt;/span&gt; &lt;span class="nb"&gt;/&lt;/span&gt; &lt;span class="mi"&gt;3&lt;/span&gt;&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;span class="m"&gt;1/6&lt;/span&gt;
+&lt;span class="nb"&gt;&amp;gt;&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;with-fixity&lt;/span&gt; &lt;span class="p"&gt;([&lt;/span&gt;&lt;span class="nb"&gt;/&lt;/span&gt; &lt;span class="n"&gt;right&lt;/span&gt;&lt;span class="p"&gt;])&lt;/span&gt;
+    &lt;span class="p"&gt;{&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt; &lt;span class="nb"&gt;/&lt;/span&gt; &lt;span class="mi"&gt;2&lt;/span&gt; &lt;span class="nb"&gt;/&lt;/span&gt; &lt;span class="mi"&gt;3&lt;/span&gt;&lt;span class="p"&gt;})&lt;/span&gt;
+&lt;span class="mi"&gt;1&lt;/span&gt; &lt;span class="m"&gt;1/2&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;In fact, this macro is hardly theoretical, since it could be implemented in a trivial 7 lines, simply expanding to uses of &lt;code&gt;splicing-let&lt;/code&gt; and &lt;code&gt;splicing-let-syntax&lt;/code&gt;:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-simple-macro&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;with-fixity&lt;/span&gt; &lt;span class="p"&gt;([&lt;/span&gt;&lt;span class="n"&gt;op:id&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;&lt;span class="n"&gt;~and&lt;/span&gt; &lt;span class="n"&gt;fixity&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;&lt;span class="n"&gt;~or&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;&lt;span class="n"&gt;~datum&lt;/span&gt; &lt;span class="n"&gt;left&lt;/span&gt;&lt;span class="p"&gt;}&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;&lt;span class="n"&gt;~datum&lt;/span&gt; &lt;span class="n"&gt;right&lt;/span&gt;&lt;span class="p"&gt;}}}]&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+    &lt;span class="n"&gt;body&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+  &lt;span class="kd"&gt;#:with&lt;/span&gt; &lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;op-tmp&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;generate-temporaries&lt;/span&gt; &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;op&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;])&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;splicing-let&lt;/span&gt; &lt;span class="p"&gt;([&lt;/span&gt;&lt;span class="n"&gt;op-tmp&lt;/span&gt; &lt;span class="n"&gt;op&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+    &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;splicing-let-syntax&lt;/span&gt; &lt;span class="p"&gt;([&lt;/span&gt;&lt;span class="n"&gt;op&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;infix-operator&lt;/span&gt; &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="n"&gt;op-tmp&lt;/span&gt; &lt;span class="o"&gt;&amp;#39;&lt;/span&gt;&lt;span class="ss"&gt;fixity&lt;/span&gt;&lt;span class="p"&gt;)]&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+      &lt;span class="n"&gt;body&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)))&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;This is not especially useful given the current set of infix operator features, but it’s easy to imagine how useful it could be in a system that also supported a notion of precedence. It is not entirely uncommon to encounter certain expressions that could be more cleanly expressed with a local set of operator precedence rules, perhaps described as a set of relations &lt;em&gt;between&lt;/em&gt; operators rather than a global table of magic precedence numbers. With traditional approaches to infix operators, parsing such code would be difficult without a very rigid syntactic structure, but this technique makes it easy.&lt;/p&gt;
+
+&lt;p&gt;As mentioned at the beginning of this blog post, this technique is also not merely a novelty—as of now, I am actively using this in &lt;a href="https://github.com/lexi-lambda/hackett"&gt;Hackett&lt;/a&gt; to support infix operators with all of the features outlined here. The Hackett implementation is a little bit fancier than the one in this blog post, since it works harder to produce better error messages. It explicitly disallows mixing left associative and right associative operators in the same expression, so it does some additional validation as part of expansion, and it arranges for source location information to be copied onto the result. It also make a different design decision to allow &lt;em&gt;any&lt;/em&gt; expression to serve as an infix operator, assuming left associativity if no fixity annotation is available.&lt;/p&gt;
+
+&lt;p&gt;If you’re interested in the code behind the additional steps Hackett takes to make infix operators more usable and complete, take a look at &lt;a href="https://github.com/lexi-lambda/hackett/blob/0d177d00a9ee96f30dd76761f1cb86f15830779f/hackett-lib/hackett/private/infix.rkt"&gt;this file for the definition of infix bindings&lt;/a&gt;, as well as &lt;a href="https://github.com/lexi-lambda/hackett/blob/0d177d00a9ee96f30dd76761f1cb86f15830779f/hackett-lib/hackett/private/kernel.rkt#L80-L101"&gt;this file for the defintion of infix application&lt;/a&gt;. My hope is to eventually add support for some sort of precedence information, though who knows—maybe infix operators will be easier to reason about if the rules are kept extremely simple. I am also considering adding support for so-called “operator sections” at some point, which would allow things like &lt;code&gt;{_ - 1}&lt;/code&gt; to serve as a shorthand for &lt;code&gt;(lambda [x] {x - 1})&lt;/code&gt;, but I haven’t yet decided if I like the tradeoffs involved.&lt;/p&gt;
+
+&lt;p&gt;It’s possible that this implementation of infix operators might also be useful in languages in the Racket ecosystem besides Hackett. However, I’m not sure it makes a ton of sense in &lt;code&gt;#lang racket&lt;/code&gt; without modifications, as variadic functions subsume many of the cases where infix operators are needed in Haskell. If there is a clamoring for this capability, I would be happy to consider extracting the functionality into a library, but as of right now, I don’t have any plans to do so.&lt;/p&gt;
+
+&lt;p&gt;Finally, the main point of this blog post is to showcase how easy it is to do things in Racket that would be impossible in most languages and difficult even in most Lisps. It also helps to show off how Hackett is already benefitting from those capabilities: while this particular feature is built-in to &lt;code&gt;#lang hackett&lt;/code&gt;, there’s no reason something similar but more powerful couldn’t be built as a separate library by a &lt;em&gt;user&lt;/em&gt; of Hackett. Even as Hackett’s author, I think that’s exciting, since makes it possible for users to experiment with improvements to the language on their own. Some of those improvements may eventually be rolled into the core language or standard library, but many of them can likely live effectively in separate libraries, accessible on-demand to those who need them. After all, that’s one of Racket’s most important promises—languages as libraries—and it’s why Hackett is a part of the Racket ecosystem.&lt;/p&gt;</description></item>
+  <item>
+   <title>Simple, safe multimethods in Racket</title>
+   <link>http://lexi-lambda.github.io/blog/2016/02/18/simple-safe-multimethods-in-racket?utm_source=macros&amp;utm_medium=RSS</link>
+   <guid isPermaLink="false">urn:http-lexi-lambda-github-io:-blog-2016-02-18-simple-safe-multimethods-in-racket</guid>
+   <pubDate>Thu, 18 Feb 2016 18:48:32 UT</pubDate>
+   <author>Alexis King</author>
+   <description>
+&lt;p&gt;Racket ships with &lt;code&gt;racket/generic&lt;/code&gt;, a system for defining &lt;em&gt;generic methods&lt;/em&gt;, functions that work differently depending on what sort of value they are supplied. I have made heavy use of this feature in my collections library, and it has worked well for my needs, but that system does have a bit of a limitation: it only supports &lt;em&gt;single dispatch&lt;/em&gt;. Method implementations may only be chosen based on a single argument, so multiple dispatch is impossible.&lt;/p&gt;
+&lt;!-- more--&gt;
+
+&lt;h1 id="motivating-multiple-dispatch"&gt;Motivating multiple dispatch&lt;/h1&gt;
+
+&lt;p&gt;What is multiple dispatch and why is it necessary? Well, in most cases, it &lt;em&gt;isn’t&lt;/em&gt; necessary at all. &lt;a href="http://dl.acm.org/citation.cfm?doid=1449764.1449808"&gt;It has been shown that multiple dispatch is much rarer than single dispatch in practice.&lt;/a&gt; However, when actually needed, having multiple dispatch in the toolbox is a valuable asset.&lt;/p&gt;
+
+&lt;p&gt;A classic example of multiple dispatch is multiplication over both scalars and vectors. Ideally, all of the following operations should work:&lt;/p&gt;
+
+&lt;pre&gt;&lt;code&gt;2 × 3 = 6
+2 × ⟨3, 4⟩ = ⟨6, 8⟩
+⟨3, 4⟩ × 2 = ⟨6, 8⟩&lt;/code&gt;&lt;/pre&gt;
+
+&lt;p&gt;In practice, most languages do not support such flexible dispatch rules without fairly complicated branching constructs to handle each permutation of input types. Furthermore, since most languages only support single dispatch (such as most object-oriented languages), it is nearly impossible to add support for a new combination of types to an existing method.&lt;/p&gt;
+
+&lt;p&gt;To illustrate the above, even if a language supported operator overloading &lt;em&gt;and&lt;/em&gt; it included a &lt;code&gt;Vector&lt;/code&gt; class that overloaded multiplication to properly work with numbers and vectors, it might not implement matrix multiplication. If a user defines a &lt;code&gt;Matrix&lt;/code&gt; class, they may overload &lt;em&gt;its&lt;/em&gt; multiplication to support numbers, vectors, and matrices, but it is impossible to extend the multiplication implementation for the &lt;code&gt;Vector&lt;/code&gt; class. That method is now completely set in stone, unless it is edited directly (and the programmer may not have access to &lt;code&gt;Vector&lt;/code&gt;’s implementation).&lt;/p&gt;
+
+&lt;p&gt;Multiple dispatch solves all of these problems. Rather than specify implementations of functions for singular types, it is possible to specify implementations for sets of types. In the above example, a programmer would be able to define a new function that operates on &lt;code&gt;Vector&lt;/code&gt; and &lt;code&gt;Matrix&lt;/code&gt; arguments. Since each definition does not “belong” to any given type, extending this set of operations is trivial.&lt;/p&gt;
+
+&lt;h1 id="multiple-dispatch-in-racket"&gt;Multiple dispatch in Racket&lt;/h1&gt;
+
+&lt;p&gt;This blog post is somewhat long and technical, so before proceeding any further, I want to show some real code that actually works so you can get a feel for what I’m talking about. As a proof-of-concept, I have created &lt;a href="https://github.com/lexi-lambda/racket-multimethod"&gt;a very simple implementation of multiple dispatch in Racket&lt;/a&gt;. The above example would look like this in Racket using my module:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="kn"&gt;#lang &lt;/span&gt;&lt;span class="nn"&gt;racket&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;require&lt;/span&gt; &lt;span class="n"&gt;multimethod&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;provide&lt;/span&gt; &lt;span class="n"&gt;mul&lt;/span&gt;
+         &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;struct-out&lt;/span&gt; &lt;span class="n"&gt;num&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+         &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;struct-out&lt;/span&gt; &lt;span class="n"&gt;vec&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;struct&lt;/span&gt; &lt;span class="n"&gt;num&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;val&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;struct&lt;/span&gt; &lt;span class="n"&gt;vec&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;vals&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-generic&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;mul&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt; &lt;span class="n"&gt;b&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-instance&lt;/span&gt; &lt;span class="p"&gt;((&lt;/span&gt;&lt;span class="n"&gt;mul&lt;/span&gt; &lt;span class="n"&gt;num&lt;/span&gt; &lt;span class="n"&gt;num&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="n"&gt;x&lt;/span&gt; &lt;span class="n"&gt;y&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;num&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;*&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;num-val&lt;/span&gt; &lt;span class="n"&gt;x&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;num-val&lt;/span&gt; &lt;span class="n"&gt;y&lt;/span&gt;&lt;span class="p"&gt;))))&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-instance&lt;/span&gt; &lt;span class="p"&gt;((&lt;/span&gt;&lt;span class="n"&gt;mul&lt;/span&gt; &lt;span class="n"&gt;num&lt;/span&gt; &lt;span class="n"&gt;vec&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="n"&gt;n&lt;/span&gt; &lt;span class="n"&gt;v&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;vec&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;map&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;curry&lt;/span&gt; &lt;span class="nb"&gt;*&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;num-val&lt;/span&gt; &lt;span class="n"&gt;n&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;vec-vals&lt;/span&gt; &lt;span class="n"&gt;v&lt;/span&gt;&lt;span class="p"&gt;))))&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-instance&lt;/span&gt; &lt;span class="p"&gt;((&lt;/span&gt;&lt;span class="n"&gt;mul&lt;/span&gt; &lt;span class="n"&gt;vec&lt;/span&gt; &lt;span class="n"&gt;num&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="n"&gt;v&lt;/span&gt; &lt;span class="n"&gt;n&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;mul&lt;/span&gt; &lt;span class="n"&gt;n&lt;/span&gt; &lt;span class="n"&gt;v&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;Pardon the somewhat clunky syntax, but the functionality is there. Using the above code works as expected:&lt;/p&gt;
+
+&lt;pre&gt;&lt;code&gt;&amp;gt; (mul (num 2) (num 3))
+(num 6)
+&amp;gt; (mul (num 2) (vec '(3 4)))
+(vec '(6 8))
+&amp;gt; (mul (vec '(3 4)) (num 2))
+(vec '(6 8))&lt;/code&gt;&lt;/pre&gt;
+
+&lt;p&gt;Making the above snippet work is not particularly hard. In fact, it’s likely that most competent Racketeers could do it without much thought. However, there’s a tiny bit more going on behind the scenes than it may seem.&lt;/p&gt;
+
+&lt;h1 id="the-problem-with-multiple-dispatch"&gt;The problem with multiple dispatch&lt;/h1&gt;
+
+&lt;p&gt;The single-dispatch design limitation of &lt;code&gt;racket/generic&lt;/code&gt; comes directly from a desire to avoid what has been described as “spooky action at a distance”, a problem that is prevalent in many systems that support methods with multiple dispatch (aka &lt;em&gt;multimethods&lt;/em&gt;). Specifically, the issue arises when new method implementations are defined for existing datatypes, which can have far-reaching effects throughout a program because the method table is global state. Both CLOS and Clojure suffer from this shortcoming.&lt;/p&gt;
+
+&lt;p&gt;Interestingly, Haskell with multi-parameter typeclasses (a nonstandard but highly useful extension) makes it quite trivial to create constructs similar to multiple dispatch (though the overload resolution is done at compile-time). The similarities are significant: Haskell &lt;em&gt;also&lt;/em&gt; suffers from the possibility of a certain sort of “spooky action”. However, Haskell’s static typing and resolution allows the compiler to catch these potential issues, known as “orphan instances”, at compile time. Even though Racket does not support the same sort of static typing, the same idea can be used to keep multiple dispatch safe using the macro system.&lt;/p&gt;
+
+&lt;h1 id="safe-dynamically-typed-multiple-dispatch"&gt;Safe, dynamically-typed multiple dispatch&lt;/h1&gt;
+
+&lt;p&gt;In order to make multiple dispatch safe, we first need to determine exactly what is unsafe. Haskell has rules for determining what constitutes an “orphan instance”, and these rules are equally applicable for determining dangerous multimethod implementations. Specifically, a definition can be considered unsafe if &lt;em&gt;both&lt;/em&gt; of the following conditions are true:&lt;/p&gt;
+
+&lt;ol&gt;
+ &lt;li&gt;The multimethod that is being implemented was declared in a different module from the implementation.&lt;/li&gt;
+ &lt;li&gt;&lt;em&gt;All&lt;/em&gt; of the types used for dispatch in the multimethod instance were declared in a different module from the implementation.&lt;/li&gt;&lt;/ol&gt;
+
+&lt;p&gt;Conversely, a multimethod implementation is safe if &lt;em&gt;either&lt;/em&gt; of the following conditions are true:&lt;/p&gt;
+
+&lt;ol&gt;
+ &lt;li&gt;The multimethod that is being implemented is declared in the same module as the implementation.&lt;/li&gt;
+ &lt;li&gt;&lt;em&gt;Any&lt;/em&gt; of the types used for dispatch in the multimethod instance are declared in the same module as the implementation.&lt;/li&gt;&lt;/ol&gt;
+
+&lt;p&gt;Why do these two rules provide a strong enough guarantee to eliminate the dangers created by global state? Well, to understand that, we need to understand what can go wrong if these rules are ignored.&lt;/p&gt;
+
+&lt;h2 id="multimethods-and-dangerous-instances"&gt;Multimethods and dangerous instances&lt;/h2&gt;
+
+&lt;p&gt;What exactly is this dangerous-sounding “spooky action”, and what causes it? Well, the trouble stems from the side-effectful nature of multimethod instance definitions. Consider the Racket module from earlier, which defines multiplication instances for scalars and vectors:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;provide&lt;/span&gt; &lt;span class="n"&gt;mul&lt;/span&gt;
+         &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;struct-out&lt;/span&gt; &lt;span class="n"&gt;num&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+         &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;struct-out&lt;/span&gt; &lt;span class="n"&gt;vec&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;struct&lt;/span&gt; &lt;span class="n"&gt;num&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;val&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;struct&lt;/span&gt; &lt;span class="n"&gt;vec&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;vals&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-generic&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;mul&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt; &lt;span class="n"&gt;b&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-instance&lt;/span&gt; &lt;span class="p"&gt;((&lt;/span&gt;&lt;span class="n"&gt;mul&lt;/span&gt; &lt;span class="n"&gt;num&lt;/span&gt; &lt;span class="n"&gt;num&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="n"&gt;x&lt;/span&gt; &lt;span class="n"&gt;y&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;num&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;*&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;num-val&lt;/span&gt; &lt;span class="n"&gt;x&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;num-val&lt;/span&gt; &lt;span class="n"&gt;y&lt;/span&gt;&lt;span class="p"&gt;))))&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-instance&lt;/span&gt; &lt;span class="p"&gt;((&lt;/span&gt;&lt;span class="n"&gt;mul&lt;/span&gt; &lt;span class="n"&gt;num&lt;/span&gt; &lt;span class="n"&gt;vec&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="n"&gt;n&lt;/span&gt; &lt;span class="n"&gt;v&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;vec&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;map&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;curry&lt;/span&gt; &lt;span class="nb"&gt;*&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;num-val&lt;/span&gt; &lt;span class="n"&gt;n&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;vec-vals&lt;/span&gt; &lt;span class="n"&gt;v&lt;/span&gt;&lt;span class="p"&gt;))))&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-instance&lt;/span&gt; &lt;span class="p"&gt;((&lt;/span&gt;&lt;span class="n"&gt;mul&lt;/span&gt; &lt;span class="n"&gt;vec&lt;/span&gt; &lt;span class="n"&gt;num&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="n"&gt;v&lt;/span&gt; &lt;span class="n"&gt;n&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;mul&lt;/span&gt; &lt;span class="n"&gt;n&lt;/span&gt; &lt;span class="n"&gt;v&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;Note that there is not actually a &lt;code&gt;(mul vec vec)&lt;/code&gt; implementation. This is intentional: there are &lt;em&gt;two&lt;/em&gt; ways to take the product of two vectors, so no default implementation is provided. However, it is possible that another module might desire an instance for &lt;code&gt;mul&lt;/code&gt; that takes the dot product, and the programmer might write the following definition:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-instance&lt;/span&gt; &lt;span class="p"&gt;((&lt;/span&gt;&lt;span class="n"&gt;mul&lt;/span&gt; &lt;span class="n"&gt;vec&lt;/span&gt; &lt;span class="n"&gt;vec&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="n"&gt;x&lt;/span&gt; &lt;span class="n"&gt;y&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;num&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;foldl&lt;/span&gt; &lt;span class="nb"&gt;+&lt;/span&gt; &lt;span class="mi"&gt;0&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;map&lt;/span&gt; &lt;span class="nb"&gt;*&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;vec-vals&lt;/span&gt; &lt;span class="n"&gt;x&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;vec-vals&lt;/span&gt; &lt;span class="n"&gt;y&lt;/span&gt;&lt;span class="p"&gt;)))))&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;However, there is something fishy about the above definition: it doesn’t need to be exported with &lt;code&gt;provide&lt;/code&gt; to work! Since instances don’t create new bindings, they only add dispatch options, they don’t ever need to &lt;code&gt;provide&lt;/code&gt; anything. This is problematic, though: it means that a program could continue to happily compile &lt;em&gt;even if&lt;/em&gt; the module containing the dot product instance was never loaded with &lt;code&gt;require&lt;/code&gt;, but an attempt to multiply two vectors would fail at runtime, claiming that there was no &lt;code&gt;(mul vec vec)&lt;/code&gt; implementation. This drastic change of behavior violates Racket programmers’ assumptions about the guarantees made by modules (&lt;code&gt;require&lt;/code&gt; should not cause any side-effects if the module’s bindings are not used).&lt;/p&gt;
+
+&lt;p&gt;Of course, while this seems potentially unexpected, it is workable: just be careful to &lt;code&gt;require&lt;/code&gt; modules containing instances. Unfortunately, it gets much worse—what if a different library defines &lt;em&gt;its own&lt;/em&gt; &lt;code&gt;(mul vec vec)&lt;/code&gt; instance? What if that instance takes the cross product instead? That library may function entirely properly on its own, but when loaded alongside the program that defines a dot product instance, it is impossible to determine which instance should be used where. Because &lt;code&gt;define-instance&lt;/code&gt; operates by modifying the aforementioned global state, the implementations clash, and the two systems &lt;em&gt;cannot&lt;/em&gt; continue to operate together as written.&lt;/p&gt;
+
+&lt;p&gt;This is pretty bad. Defining extra instances is a reasonable use-case for multiple dispatch, but if these instances can break &lt;em&gt;third-party code&lt;/em&gt;, how can they be trusted? This sort of problem can make multiple dispatch difficult to reason about and even more difficult to trust.&lt;/p&gt;
+
+&lt;h2 id="what-determines-safety"&gt;What determines safety?&lt;/h2&gt;
+
+&lt;p&gt;With those problems in mind, we can turn back to the two rules for &lt;em&gt;safe&lt;/em&gt; multiple dispatch. How do they prevent the above issues? Well, let’s take them one at a time.&lt;/p&gt;
+
+&lt;p&gt;Remember that an instance can be unequivocally determined to be safe if either of the two conditions are true, so we can consider them entirely independently. The first one is simple—an instance is safe if the following condition holds:&lt;/p&gt;
+
+&lt;blockquote&gt;
+ &lt;p&gt;The multimethod that is being implemented is declared in the same module as the implementation.&lt;/p&gt;&lt;/blockquote&gt;
+
+&lt;p&gt;This one is pretty obvious. It is impossible to create a “bad” instance of a method declared in the same module because it is impossible to import the method without also bringing in the instance. Furthermore, a conflicting instance cannot be defined at the place where the types themselves are defined because that would require a circular module dependency, which Racket does not permit.&lt;/p&gt;
+
+&lt;p&gt;With the above explanation in mind, the second condition should make sense, too:&lt;/p&gt;
+
+&lt;blockquote&gt;
+ &lt;p&gt;&lt;em&gt;Any&lt;/em&gt; of the types used for dispatch in the multimethod instance are declared in the same module as the implementation.&lt;/p&gt;&lt;/blockquote&gt;
+
+&lt;p&gt;The same argument for the first point holds for the second, but with the parties swapped. Again, it is impossible to use the instance without somehow requiring the module that defines the datatype itself, so the instance would always be required, anyway. The most interesting aspect of this condition is that it demonstrates that instances can be defined for existing datatypes (that are defined in other modules) just so long as &lt;em&gt;at least one&lt;/em&gt; of the datatypes is defined in the same module. This continues to permit the important use-case of extending the interfaces of existing types.&lt;/p&gt;
+
+&lt;h2 id="encoding-the-safety-rules-into-rackets-macro-system"&gt;Encoding the safety rules into Racket’s macro system&lt;/h2&gt;
+
+&lt;p&gt;In order to keep track of which methods and instances are defined where, I leveraged a technique based on the one &lt;a href="http://www.ccs.neu.edu/racket/pubs/scheme2007-ctf.pdf"&gt;used by Typed Racket to keep track of whether or not a typed identifier is used in a typed or untyped context&lt;/a&gt;. However, instead of using a simple mutable boolean flag, I used a mutable &lt;a href="http://docs.racket-lang.org/syntax/syntax-helpers.html#%28tech._identifier._set%29"&gt;free identifier set&lt;/a&gt;, which keeps track of the identifiers within a given module that should be considered “privileged”.&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="kn"&gt;#lang &lt;/span&gt;&lt;span class="nn"&gt;racket/base&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;require&lt;/span&gt; &lt;span class="n"&gt;syntax/id-set&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;provide&lt;/span&gt; &lt;span class="n"&gt;mark-id-as-privileged!&lt;/span&gt;
+         &lt;span class="n"&gt;id-privileged?&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;define&lt;/span&gt; &lt;span class="n"&gt;privileged-ids&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;mutable-free-id-set&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;define&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;mark-id-as-privileged!&lt;/span&gt; &lt;span class="n"&gt;id&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;free-id-set-add!&lt;/span&gt; &lt;span class="n"&gt;privileged-ids&lt;/span&gt; &lt;span class="n"&gt;id&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;define&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;id-privileged?&lt;/span&gt; &lt;span class="n"&gt;id&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;free-id-set-member?&lt;/span&gt; &lt;span class="n"&gt;privileged-ids&lt;/span&gt; &lt;span class="n"&gt;id&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;Making this work with &lt;code&gt;define-generic&lt;/code&gt; is obvious: just invoke &lt;code&gt;mark-id-as-privileged!&lt;/code&gt; on the method name to note that the method is “privileged” in the scope of the current module. Keeping track of privileged structs is similarly straightforward, though it is a little more devious: the &lt;code&gt;multimethod&lt;/code&gt; module provides a custom &lt;code&gt;struct&lt;/code&gt; macro that just expands to &lt;code&gt;struct&lt;/code&gt; from &lt;code&gt;racket/base&lt;/code&gt;, but adds privilege information.&lt;/p&gt;
+
+&lt;p&gt;The &lt;code&gt;define-instance&lt;/code&gt; macro does all the heavy lifting to ensure that only privileged identifiers can be used in instance definitions. A simple check for the identifier annotations is performed before proceeding with macro expansion:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;unless&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;or&lt;/span&gt; &lt;span class="n"&gt;privileged?&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;ormap&lt;/span&gt; &lt;span class="n"&gt;id-privileged?&lt;/span&gt; &lt;span class="n"&gt;types&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;assert-privileged-struct!&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;first&lt;/span&gt; &lt;span class="n"&gt;types&lt;/span&gt;&lt;span class="p"&gt;)))&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;When the privilege checks fail, an error is raised:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;define&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;assert-privileged-struct!&lt;/span&gt; &lt;span class="n"&gt;id&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;unless&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;id-privileged?&lt;/span&gt; &lt;span class="n"&gt;id&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+    &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;raise-syntax-error&lt;/span&gt; &lt;span class="o"&gt;&amp;#39;&lt;/span&gt;&lt;span class="ss"&gt;define-instance&lt;/span&gt;
+                        &lt;span class="s2"&gt;"expected name of struct defined in current module"&lt;/span&gt;
+                        &lt;span class="n"&gt;id&lt;/span&gt;&lt;span class="p"&gt;)))&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;With the above safeguards in place, the dangerous dot product implementation from above &lt;strong&gt;would not be allowed&lt;/strong&gt;. The checks manage to encode both of the safety rules into the macro system such that invalid instances will fail &lt;em&gt;at compile time&lt;/em&gt;, preventing dangerous uses of multimethods from ever slipping by unnoticed.&lt;/p&gt;
+
+&lt;h2 id="actually-implementing-multiple-dispatch"&gt;Actually implementing multiple dispatch&lt;/h2&gt;
+
+&lt;p&gt;The rest of the multimethod implementation is relatively straightforward and is not even particularly robust. If anything, it is the bare minimum of what would be needed to allow the safety mechanisms above to work. Lots of features that would likely be needed in a real implementation are not included, and graceful error handling is largely ignored.&lt;/p&gt;
+
+&lt;p&gt;Multimethods themselves are implemented as Racket &lt;a href="http://docs.racket-lang.org/guide/proc-macros.html#%28tech._transformer._binding%29"&gt;transformer bindings&lt;/a&gt; containing custom data, including a reference to the multimethod’s arity and dispatch table. The custom datatype includes a &lt;code&gt;prop:procedure&lt;/code&gt; structure type property, which allows such bindings to also function as macros. The macro procedure expands to an operation that looks up the proper instance to use in the multimethod’s dispatch table and invokes it with the supplied arguments.&lt;/p&gt;
+
+&lt;p&gt;The relevant code for defining multimethods is reproduced below:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;begin-for-syntax&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;struct&lt;/span&gt; &lt;span class="n"&gt;multimethod&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;arity&lt;/span&gt; &lt;span class="n"&gt;dispatch-table&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+    &lt;span class="kd"&gt;#:property&lt;/span&gt; &lt;span class="nb"&gt;prop:procedure&lt;/span&gt;
+    &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;λ&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;method&lt;/span&gt; &lt;span class="n"&gt;stx&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+      &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;syntax-parse&lt;/span&gt; &lt;span class="n"&gt;stx&lt;/span&gt;
+        &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="n"&gt;method&lt;/span&gt; &lt;span class="n"&gt;arg&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+         &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;apply-multimethod&lt;/span&gt; &lt;span class="n"&gt;method&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;list&lt;/span&gt; &lt;span class="n"&gt;arg&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;))]&lt;/span&gt;
+        &lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;method&lt;/span&gt;
+         &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;λ&lt;/span&gt; &lt;span class="n"&gt;args&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;apply-multimethod&lt;/span&gt; &lt;span class="n"&gt;method&lt;/span&gt; &lt;span class="n"&gt;args&lt;/span&gt;&lt;span class="p"&gt;))]))))&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;define-syntax&lt;/span&gt; &lt;span class="n"&gt;define-generic&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;syntax-parser&lt;/span&gt;
+    &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="k"&gt;_&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;method:id&lt;/span&gt; &lt;span class="n"&gt;arg:id&lt;/span&gt; &lt;span class="n"&gt;...+&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+     &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;with-syntax&lt;/span&gt; &lt;span class="p"&gt;([&lt;/span&gt;&lt;span class="n"&gt;arity&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;length&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;attribute&lt;/span&gt; &lt;span class="n"&gt;arg&lt;/span&gt;&lt;span class="p"&gt;))]&lt;/span&gt;
+                   &lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;dispatch-table&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;generate-temporary&lt;/span&gt; &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="n"&gt;method&lt;/span&gt;&lt;span class="p"&gt;)])&lt;/span&gt;
+       &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;mark-id-as-privileged!&lt;/span&gt; &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="n"&gt;method&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+       &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;begin&lt;/span&gt;
+           &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;define&lt;/span&gt; &lt;span class="n"&gt;dispatch-table&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;make-hash&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+           &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;define-syntax&lt;/span&gt; &lt;span class="n"&gt;method&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;multimethod&lt;/span&gt; &lt;span class="n"&gt;arity&lt;/span&gt; &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="n"&gt;dispatch-table&lt;/span&gt;&lt;span class="p"&gt;))))]))&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;The dispatch tables are implemented entirely in terms of Racket’s structure types, so while they can be defined on arbitrary structure types (including ones defined in the Racket standard library), they &lt;em&gt;cannot&lt;/em&gt; be defined on primitives such as pairs or vectors. Implementations are registered in the dispatch table using the compile-time information associated with structs’ transformer bindings, and the same information is retrieved from struct instances at runtime to look up the proper implementation to call. Notably, this only works if the struct is &lt;code&gt;#:transparent&lt;/code&gt;, or more generally and accurately, if the calling code has access to the struct’s inspector. All structs defined by the &lt;code&gt;struct&lt;/code&gt; form from the &lt;code&gt;multimethod&lt;/code&gt; module are automatically marked as &lt;code&gt;#:transparent&lt;/code&gt;.&lt;/p&gt;
+
+&lt;p&gt;The following code implements defining multimethod instances:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;begin-for-syntax&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;define&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;assert-privileged-struct!&lt;/span&gt; &lt;span class="n"&gt;id&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+    &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;unless&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;id-privileged?&lt;/span&gt; &lt;span class="n"&gt;id&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+      &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;raise-syntax-error&lt;/span&gt; &lt;span class="o"&gt;&amp;#39;&lt;/span&gt;&lt;span class="ss"&gt;define-instance&lt;/span&gt;
+                          &lt;span class="s2"&gt;"expected name of struct defined in current module"&lt;/span&gt;
+                          &lt;span class="n"&gt;id&lt;/span&gt;&lt;span class="p"&gt;))))&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;define-syntax&lt;/span&gt; &lt;span class="n"&gt;define-instance&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;syntax-parser&lt;/span&gt;
+    &lt;span class="c1"&gt;; standard (define (proc ...) ...) shorthand&lt;/span&gt;
+    &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="k"&gt;_&lt;/span&gt; &lt;span class="p"&gt;((&lt;/span&gt;&lt;span class="n"&gt;method&lt;/span&gt; &lt;span class="n"&gt;type:id&lt;/span&gt; &lt;span class="n"&gt;...+&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="o"&gt;.&lt;/span&gt; &lt;span class="n"&gt;args&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="n"&gt;body:expr&lt;/span&gt; &lt;span class="n"&gt;...+&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+     &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-instance&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;method&lt;/span&gt; &lt;span class="n"&gt;type&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;λ&lt;/span&gt; &lt;span class="n"&gt;args&lt;/span&gt; &lt;span class="n"&gt;body&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;))]&lt;/span&gt;
+    &lt;span class="c1"&gt;; full (define proc lambda-expr) notation&lt;/span&gt;
+    &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="k"&gt;_&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;method&lt;/span&gt; &lt;span class="n"&gt;type:id&lt;/span&gt; &lt;span class="n"&gt;...+&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="n"&gt;proc:expr&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+     &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;let*&lt;/span&gt; &lt;span class="p"&gt;([&lt;/span&gt;&lt;span class="n"&gt;multimethod&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;syntax-local-value&lt;/span&gt; &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="n"&gt;method&lt;/span&gt;&lt;span class="p"&gt;)]&lt;/span&gt;
+            &lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;privileged?&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;id-privileged?&lt;/span&gt; &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="n"&gt;method&lt;/span&gt;&lt;span class="p"&gt;)])&lt;/span&gt;
+       &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;unless&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;or&lt;/span&gt; &lt;span class="n"&gt;privileged?&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;ormap&lt;/span&gt; &lt;span class="n"&gt;id-privileged?&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;attribute&lt;/span&gt; &lt;span class="n"&gt;type&lt;/span&gt;&lt;span class="p"&gt;)))&lt;/span&gt;
+         &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;assert-privileged-struct!&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;first&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;attribute&lt;/span&gt; &lt;span class="n"&gt;type&lt;/span&gt;&lt;span class="p"&gt;))))&lt;/span&gt;
+       &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;with-syntax&lt;/span&gt; &lt;span class="p"&gt;([&lt;/span&gt;&lt;span class="n"&gt;dispatch-table&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;multimethod-dispatch-table&lt;/span&gt; &lt;span class="n"&gt;multimethod&lt;/span&gt;&lt;span class="p"&gt;)]&lt;/span&gt;
+                     &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="n"&gt;struct-type-id&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;map&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;compose1&lt;/span&gt; &lt;span class="nb"&gt;first&lt;/span&gt; &lt;span class="n"&gt;extract-struct-info&lt;/span&gt; &lt;span class="nb"&gt;syntax-local-value&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+                                                &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;attribute&lt;/span&gt; &lt;span class="n"&gt;type&lt;/span&gt;&lt;span class="p"&gt;))])&lt;/span&gt;
+         &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;let&lt;/span&gt; &lt;span class="p"&gt;([&lt;/span&gt;&lt;span class="n"&gt;struct-types&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;list&lt;/span&gt; &lt;span class="n"&gt;struct-type-id&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)])&lt;/span&gt;
+             &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;hash-set!&lt;/span&gt; &lt;span class="n"&gt;dispatch-table&lt;/span&gt; &lt;span class="n"&gt;struct-types&lt;/span&gt; &lt;span class="n"&gt;proc&lt;/span&gt;&lt;span class="p"&gt;))))]))&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;The resulting implementation is a useful, if certainly incomplete implementation of multimethods in Racket that does not sacrifice the safety provided by &lt;code&gt;racket/generic&lt;/code&gt;’s single-dispatch approach.&lt;/p&gt;
+
+&lt;h1 id="related-work-advantages-and-disadvantages-and-areas-for-future-improvement"&gt;Related work, advantages and disadvantages, and areas for future improvement&lt;/h1&gt;
+
+&lt;p&gt;As previously mentioned, this implementation of multiple dispatch was inspired by the types of APIs offered by CLOS and Clojure while also maintaining the safety of &lt;code&gt;racket/generic&lt;/code&gt;. The inspiration for the safety rules came from GHC’s detection of orphan instances. Although most of the ideas presented above exist in other places, I am unsure if the concept of safety checking has been used before in any dynamically-typed programming languages.&lt;/p&gt;
+
+&lt;p&gt;The primary advantage offered over Racket’s existing generics system is obvious: multiple dispatch. Furthermore, this system can supersede many uses of &lt;code&gt;racket/generic&lt;/code&gt; simply by dispatching on a single type. However, the current implementation does &lt;em&gt;not&lt;/em&gt; support all of the features of &lt;code&gt;racket/generic&lt;/code&gt;, such as supporting non-structure types and allowing fallback implementations. While those are well within the realm of possibility, other things like attaching structure type properties are probably not possible with this approach, so it is unlikely that the existing system could be subsumed by one like this one.&lt;/p&gt;
+
+&lt;p&gt;Additionally, this implementation would almost certainly need numerous improvements before being useful to most programmers:&lt;/p&gt;
+
+&lt;ul&gt;
+ &lt;li&gt;
+  &lt;p&gt;&lt;strong&gt;Good error reporting for failure cases.&lt;/strong&gt; Right now, even something obvious like calling a method on values that do not implement it simply fails with an error produced by &lt;code&gt;hash-ref&lt;/code&gt;. In a more interesting sense, using the arity to generate compile-time error messages for &lt;code&gt;define-instance&lt;/code&gt; would be a nice improvement.&lt;/p&gt;&lt;/li&gt;
+ &lt;li&gt;
+  &lt;p&gt;&lt;strong&gt;Support for Racket primitive data types.&lt;/strong&gt; This might require some cooperation from Racket itself to permit an elegant implementation, but they could also just be special-cased. So long as lookup for primitives was done &lt;em&gt;after&lt;/em&gt; consulting the main dispatch table, there wouldn’t be any performance hit for non-primitive types.&lt;/p&gt;&lt;/li&gt;
+ &lt;li&gt;
+  &lt;p&gt;&lt;strong&gt;Option to supply fallback implementations.&lt;/strong&gt; This wouldn’t be too hard at all, though it’s questionable whether or not it would be useful without method groupings like &lt;code&gt;define/generic&lt;/code&gt; provides. There would likely also need to be some sort of way to check if a set of values implements a particular method.&lt;/p&gt;&lt;/li&gt;
+ &lt;li&gt;
+  &lt;p&gt;&lt;strong&gt;Better cooperation with structure inspectors to alleviate the need for all structures to be transparent.&lt;/strong&gt; It’s currently unclear to me how exactly this works and how it &lt;em&gt;should&lt;/em&gt; work. There might be a better way to do this without mucking with inspectors.&lt;/p&gt;&lt;/li&gt;
+ &lt;li&gt;
+  &lt;p&gt;&lt;strong&gt;Much more flexible argument lists, including the ability to specify arguments that are not used for dispatch.&lt;/strong&gt; This is really a pretty fundamental requirement, but the parsing required was significant enough for me to put it off for this initial prototype.&lt;/p&gt;&lt;/li&gt;
+ &lt;li&gt;
+  &lt;p&gt;&lt;strong&gt;Scribble forms to document generic methods and their instances.&lt;/strong&gt; This is something &lt;code&gt;racket/generic&lt;/code&gt; &lt;em&gt;doesn’t&lt;/em&gt; have, and it has suffered for it. It would be very nice to have easy documentation forms for multimethods.&lt;/p&gt;&lt;/li&gt;
+ &lt;li&gt;
+  &lt;p&gt;&lt;strong&gt;Proper consideration of struct subtyping.&lt;/strong&gt; Racket structs support subtyping, which I have not given much thought for this prototype. It is possible that subtyping violates constraints I had assumed would hold, so reviewing the existing code with that context would be useful.&lt;/p&gt;&lt;/li&gt;&lt;/ul&gt;
+
+&lt;p&gt;I’m not sure how much effort is involved in most of the above ideas, and in fact I’m not even completely sure how useful this system is to begin with. I have not found myself reaching much for multiple dispatch in my time as a Racket programmer, but that could simply be because it was previously unavailable. It will be interesting to see if that changes now that I have built this system, even if it is a bit rough around the edges.&lt;/p&gt;
+
+&lt;h1 id="conclusion"&gt;Conclusion&lt;/h1&gt;
+
+&lt;p&gt;Despite the lack of need for multiple dispatch to solve most problems, as indicated by its general lack of support in mainstream programming languages, it’s a nice tool to have in the toolbox, and it &lt;em&gt;is&lt;/em&gt; asked for in the Racket community from time to time (perhaps due to its familiarity in other parts of the Lisp world). Time will tell if pointing people to something like this will create or stifle interest in multiple dispatch for Racket.&lt;/p&gt;
+
+&lt;p&gt;The source for the &lt;a href="https://github.com/lexi-lambda/racket-multimethod"&gt;&lt;code&gt;multimethod&lt;/code&gt; package can be found here&lt;/a&gt; if you are at all interested in playing with it yourself.&lt;/p&gt;</description></item>
+  <item>
+   <title>ADTs in Typed Racket with macros</title>
+   <link>http://lexi-lambda.github.io/blog/2015/12/21/adts-in-typed-racket-with-macros?utm_source=macros&amp;utm_medium=RSS</link>
+   <guid isPermaLink="false">urn:http-lexi-lambda-github-io:-blog-2015-12-21-adts-in-typed-racket-with-macros</guid>
+   <pubDate>Mon, 21 Dec 2015 17:57:07 UT</pubDate>
+   <author>Alexis King</author>
+   <description>
+&lt;p&gt;Macros are one of Racket&amp;rsquo;s flagship features, and its macro system really is state of the art. Of course, it can sometimes be difficult to demonstrate &lt;em&gt;why&lt;/em&gt; macros are so highly esteemed, in part because it can be hard to find self-contained examples of using macros in practice. Of course, one thing that macros are perfect for is filling a &amp;ldquo;hole&amp;rdquo; in the language by introducing a feature a language lacks, and one of those features in Typed Racket is &lt;strong&gt;ADTs&lt;/strong&gt;.&lt;/p&gt;
+&lt;!-- more--&gt;
+
+&lt;h1 id="warning-this-is-not-a-macro-tutorial"&gt;Warning: this is not a macro tutorial&lt;/h1&gt;
+
+&lt;p&gt;First, a disclaimer: this post assumes at least some knowledge of Scheme/Racket macros. Ideally, you would be familiar with Racket itself. But if you aren&amp;rsquo;t, fear not: if you get lost, don&amp;rsquo;t worry. Hold on to the bigger picture, and you&amp;rsquo;ll likely learn more than someone who knows enough to follow all the way through. If you &lt;em&gt;are&lt;/em&gt; interested in learning about macros, I must recommend Greg Hendershott&amp;rsquo;s &lt;a href="http://www.greghendershott.com/fear-of-macros/"&gt;Fear of Macros&lt;/a&gt;. It is good. This is not that.&lt;/p&gt;
+
+&lt;p&gt;Now, with that out of the way, let&amp;rsquo;s get started.&lt;/p&gt;
+
+&lt;h1 id="what-were-building"&gt;What we&amp;rsquo;re building&lt;/h1&gt;
+
+&lt;p&gt;&lt;a href="https://en.wikipedia.org/wiki/Algebraic_data_type"&gt;Algebraic data types&lt;/a&gt;, or &lt;em&gt;ADTs&lt;/em&gt;, are a staple of the ML family of functional programming languages. I won&amp;rsquo;t go into detail here—I want to focus on the implementation—but they&amp;rsquo;re a very descriptive way of modeling data that encourages designing functions in terms of pattern-matching, something that Racket is already good at.&lt;/p&gt;
+
+&lt;p&gt;Racket also already has a facility for creating custom data structures in the form of &lt;em&gt;structs&lt;/em&gt;, which are extremely flexible, but also a little verbose. Racket structs are more powerful than we need, but that means we can implement our ADTs in terms of Racket&amp;rsquo;s struct system.&lt;/p&gt;
+
+&lt;p&gt;With that in mind, what should our syntax look like? Well, let&amp;rsquo;s consider a quintessential example of ADTs: modeling a simple tree. For now, let&amp;rsquo;s just consider a tree of integers. For reference, the Haskell syntax for such a data structure would look like this:&lt;/p&gt;
+
+&lt;div class="brush: haskell"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="kr"&gt;data&lt;/span&gt; &lt;span class="kt"&gt;Tree&lt;/span&gt; &lt;span class="ow"&gt;=&lt;/span&gt; &lt;span class="kt"&gt;Empty&lt;/span&gt;
+          &lt;span class="o"&gt;|&lt;/span&gt; &lt;span class="kt"&gt;Leaf&lt;/span&gt; &lt;span class="kt"&gt;Int&lt;/span&gt;
+          &lt;span class="o"&gt;|&lt;/span&gt; &lt;span class="kt"&gt;Node&lt;/span&gt; &lt;span class="kt"&gt;Tree&lt;/span&gt; &lt;span class="kt"&gt;Tree&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;This already demonstrates a few of the core things we&amp;rsquo;ll need to build:&lt;/p&gt;
+
+&lt;ol&gt;
+ &lt;li&gt;Each ADT has a &lt;em&gt;data type&lt;/em&gt;, in this case &lt;code&gt;Tree&lt;/code&gt;. This name only exists in the world of types, it isn&amp;rsquo;t a value.&lt;/li&gt;
+ &lt;li&gt;Each ADT has various &lt;em&gt;data constructors&lt;/em&gt;, in this case &lt;code&gt;Leaf&lt;/code&gt; and &lt;code&gt;Node&lt;/code&gt;.&lt;/li&gt;
+ &lt;li&gt;Each data constructor may accept any number of arguments, each of which have a specific type.&lt;/li&gt;
+ &lt;li&gt;The types that data constructors may accept include the ADT&amp;rsquo;s datatype itself—that is, definitions can be recursive.&lt;/li&gt;&lt;/ol&gt;
+
+&lt;p&gt;Of course, there&amp;rsquo;s one more important feature we&amp;rsquo;re missing: polymorphism. Our definition of a tree is overly-specific, and really, it should be able to hold any kind of data, not just integers. In Haskell, we can do that by adding a type parameter:&lt;/p&gt;
+
+&lt;div class="brush: haskell"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="kr"&gt;data&lt;/span&gt; &lt;span class="kt"&gt;Tree&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt; &lt;span class="ow"&gt;=&lt;/span&gt; &lt;span class="kt"&gt;Empty&lt;/span&gt;
+            &lt;span class="o"&gt;|&lt;/span&gt; &lt;span class="kt"&gt;Leaf&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt;
+            &lt;span class="o"&gt;|&lt;/span&gt; &lt;span class="kt"&gt;Node&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="kt"&gt;Tree&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="kt"&gt;Tree&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;With this in mind, we can add a fifth and final point to our list:&lt;/p&gt;
+
+&lt;p&gt; 
+ &lt;ol start="5"&gt;
+  &lt;li&gt;ADTs must be able to be parametrically polymorphic.&lt;/li&gt;&lt;/ol&gt;&lt;/p&gt;
+
+&lt;p&gt;That covers all of our requirements for basic ADTs. Now we&amp;rsquo;re ready to port this idea to Racket.&lt;/p&gt;
+
+&lt;h2 id="describing-adts-in-racket"&gt;Describing ADTs in Racket&lt;/h2&gt;
+
+&lt;p&gt;How should we take the Haskell syntax for an ADT definition and adapt it to Racket&amp;rsquo;s parenthetical s-expressions? By taking some cues from the Haskell implementation, Typed Racket&amp;rsquo;s type syntax, and Racket&amp;rsquo;s naming conventions, a fairly logical syntax emerges:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-datatype&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Tree&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+  &lt;span class="n"&gt;Empty&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Leaf&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Node&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Tree&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Tree&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;)))&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;This looks pretty good. Just like with the Haskell implementation, &lt;code&gt;Tree&lt;/code&gt; should only exist at the type level, and &lt;code&gt;Empty&lt;/code&gt;, &lt;code&gt;Leaf&lt;/code&gt;, and &lt;code&gt;Node&lt;/code&gt; should be constructor functions. Our syntax mirrors Racket function application, too—the proper way to create a leaf would be &lt;code&gt;(Leaf 7)&lt;/code&gt;.&lt;/p&gt;
+
+&lt;p&gt;Now that we can create ADT values, how should we extract the values from them? Well, just like in ML-likes, we can use pattern-matching. We don&amp;rsquo;t need to reinvent the wheel for this one; we should be able to just use Racket&amp;rsquo;s &lt;code&gt;&lt;a href="http://docs.racket-lang.org/reference/match.html#(form._((lib._racket/match..rkt)._match))" style="color: inherit"&gt;match&lt;/a&gt;&lt;/code&gt; with our datatypes. For example, a function that sums all the values in a tree might look like this:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;:&lt;/span&gt; &lt;span class="n"&gt;tree-sum&lt;/span&gt; &lt;span class="p"&gt;((&lt;/span&gt;&lt;span class="n"&gt;Tree&lt;/span&gt; &lt;span class="n"&gt;Integer&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="k"&gt;-&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;Integer&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;define&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;tree-sum&lt;/span&gt; &lt;span class="n"&gt;tree&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;match&lt;/span&gt; &lt;span class="n"&gt;tree&lt;/span&gt;
+    &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="n"&gt;Empty&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;    &lt;span class="mi"&gt;0&lt;/span&gt;               &lt;span class="p"&gt;]&lt;/span&gt;
+    &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="n"&gt;Leaf&lt;/span&gt; &lt;span class="n"&gt;n&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;   &lt;span class="n"&gt;n&lt;/span&gt;               &lt;span class="p"&gt;]&lt;/span&gt;
+    &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="n"&gt;Node&lt;/span&gt; &lt;span class="n"&gt;l&lt;/span&gt; &lt;span class="n"&gt;r&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;+&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;tree-sum&lt;/span&gt; &lt;span class="n"&gt;l&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+                   &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;tree-sum&lt;/span&gt; &lt;span class="n"&gt;r&lt;/span&gt;&lt;span class="p"&gt;))]))&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;Given that Racket&amp;rsquo;s &lt;code&gt;struct&lt;/code&gt; form automatically produces identifiers that cooperate with &lt;code&gt;match&lt;/code&gt;, this shouldn&amp;rsquo;t be hard at all. And with our syntax settled, we&amp;rsquo;re ready to begin implementation.&lt;/p&gt;
+
+&lt;h1 id="implementing-adts-as-syntax"&gt;Implementing ADTs as syntax&lt;/h1&gt;
+
+&lt;p&gt;Now for the fun part. To implement our ADT syntax, we&amp;rsquo;ll employ Racket&amp;rsquo;s industrial-strength macro DSL, &lt;a href="http://docs.racket-lang.org/syntax/stxparse.html"&gt;&lt;code&gt;syntax/parse&lt;/code&gt;&lt;/a&gt;. The &lt;code&gt;syntax/parse&lt;/code&gt; library works like the traditional Scheme &lt;code&gt;syntax-case&lt;/code&gt; on steroids, and one of the most useful features is the ability to define &amp;ldquo;syntax classes&amp;rdquo; that encapsulate reusable parsing rules into declarative components.&lt;/p&gt;
+
+&lt;p&gt;Since this is not a macro tutorial, the following implementation assumes you already know how to use &lt;code&gt;syntax/parse&lt;/code&gt;. However, all of the concepts here are well within the reaches of any intermediate macrologist, so don&amp;rsquo;t be intimidated by some of the more complex topics at play.&lt;/p&gt;
+
+&lt;h2 id="parsing-types-with-a-syntax-class"&gt;Parsing types with a syntax class&lt;/h2&gt;
+
+&lt;p&gt;To implement ADTs, we&amp;rsquo;re going to want to define exactly one syntax class, a class that describes the grammar for a type. As we&amp;rsquo;ve seen, types can be bare identifiers, like &lt;code&gt;Tree&lt;/code&gt;, or they can be identifiers with parameters, like &lt;code&gt;(Tree a)&lt;/code&gt;. We&amp;rsquo;ll want to cover both cases.&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;begin-for-syntax&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-syntax-class&lt;/span&gt; &lt;span class="n"&gt;type&lt;/span&gt;
+    &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;pattern&lt;/span&gt; &lt;span class="n"&gt;name:id&lt;/span&gt; &lt;span class="kd"&gt;#:attr&lt;/span&gt; &lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;param&lt;/span&gt; &lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt; &lt;span class="o"&gt;&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;())&lt;/span&gt;
+    &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;pattern&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;name:id&lt;/span&gt; &lt;span class="n"&gt;param&lt;/span&gt; &lt;span class="n"&gt;...+&lt;/span&gt;&lt;span class="p"&gt;))))&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;This syntax class has two rules, one that&amp;rsquo;s a bare identifier, and one that&amp;rsquo;s a list. The ellipsis followed by a plus (&lt;code&gt;...+&lt;/code&gt;) in the second example means &amp;ldquo;one or more&amp;rdquo;, so parsing those parameters will automatically be handled for us. In the bare identifier example, we use &lt;code&gt;#:attr&lt;/code&gt; to give the &lt;code&gt;param&lt;/code&gt; attribute the default value of an empty list, so this syntax class will actually &lt;em&gt;normalize&lt;/em&gt; the input we get in addition to actually parsing it.&lt;/p&gt;
+
+&lt;h2 id="a-first-attempt-at-define-datatype"&gt;A first attempt at &lt;code&gt;define-datatype&lt;/code&gt;&lt;/h2&gt;
+
+&lt;p&gt;Now we can move on to actually implementing &lt;code&gt;define-datatype&lt;/code&gt;. The rules are simple: we need to generate a structure type for each one of the data constructors, and we need to generate a type definition for the parent type itself. This is pretty simple to implement using &lt;code&gt;syntax-parser&lt;/code&gt;, which actually does the parsing for our macro.&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;define-syntax&lt;/span&gt; &lt;span class="n"&gt;define-datatype&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;syntax-parser&lt;/span&gt;
+    &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="k"&gt;_&lt;/span&gt; &lt;span class="n"&gt;type-name:type&lt;/span&gt; &lt;span class="n"&gt;data-constructor:type&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+     &lt;span class="p"&gt;]))&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;This definition will do all the parsing we need. It parses the entire macro &amp;ldquo;invocation&amp;rdquo;, ignoring the first datum with &lt;code&gt;_&lt;/code&gt; (which will just be the identifier &lt;code&gt;define-datatype&lt;/code&gt;), then expecting a &lt;code&gt;type-name&lt;/code&gt;, which uses the &lt;code&gt;type&lt;/code&gt; syntax class we defined above. Next, we expect zero or more &lt;code&gt;data-constructor&lt;/code&gt;s, which also use the &lt;code&gt;type&lt;/code&gt; syntax class. That&amp;rsquo;s all we have to do for parsing. We now have all the information we need to actually output the expansion for the macro.&lt;/p&gt;
+
+&lt;p&gt;Of course, it won&amp;rsquo;t be that easy: this is the difficult part. The first step is to generate a Racket struct for each data constructor. We can do this pretty easily with some simple use of Racket&amp;rsquo;s syntax templating facility. A naïve attempt would look like this:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;define-syntax&lt;/span&gt; &lt;span class="n"&gt;define-datatype&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;syntax-parser&lt;/span&gt;
+    &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="k"&gt;_&lt;/span&gt; &lt;span class="n"&gt;type-name:type&lt;/span&gt; &lt;span class="n"&gt;data-constructor:type&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+     &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;begin&lt;/span&gt;
+         &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;struct&lt;/span&gt; &lt;span class="n"&gt;data-constructor.name&lt;/span&gt; &lt;span class="p"&gt;([&lt;/span&gt;&lt;span class="n"&gt;f&lt;/span&gt; &lt;span class="n"&gt;:&lt;/span&gt; &lt;span class="n"&gt;data-constructor.param&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+         &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;))]))&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;This is actually really close to being correct. This will generate a struct definition for each &lt;code&gt;data-constructor&lt;/code&gt;, where each struct has the name of the data constructor and the same number of fields as arguments provided. The trouble is that in Racket structs, all of the fields have &lt;em&gt;names&lt;/em&gt;, but in our ADTs, all the fields are anonymous and by-position. Currently, we&amp;rsquo;re just using the same name for &lt;em&gt;all&lt;/em&gt; the fields, &lt;code&gt;f&lt;/code&gt;, so if any data constructor has two or more fields, we&amp;rsquo;ll get an error.&lt;/p&gt;
+
+&lt;p&gt;Since we don&amp;rsquo;t care about the field names, what we want to do is just generate random names for every field. To do this, we can use a Racket function called &lt;code&gt;generate-temporary&lt;/code&gt;, which generates random identifiers. Our next attempt might look like this:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="o"&gt;#`&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;begin&lt;/span&gt;
+    &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;struct&lt;/span&gt; &lt;span class="n"&gt;data-constructor.name&lt;/span&gt;
+      &lt;span class="p"&gt;([&lt;/span&gt;&lt;span class="o"&gt;#,&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;generate-temporary&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="n"&gt;:&lt;/span&gt; &lt;span class="n"&gt;data-constructor.param&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+    &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;The &lt;code&gt;#,&lt;/code&gt; lets us &amp;ldquo;escape&amp;rdquo; from the template to execute &lt;code&gt;(generate-temporary)&lt;/code&gt; and interpolate its result into the syntax. Unfortunately, this doesn&amp;rsquo;t work. We &lt;em&gt;do&lt;/em&gt; generate a random field name, but the ellipsis will re-use the same generated value when it repeats the fields, rendering our whole effort pointless. We need to generate the field names once per type.&lt;/p&gt;
+
+&lt;h2 id="more-leveraging-syntax-classes"&gt;More leveraging syntax classes&lt;/h2&gt;
+
+&lt;p&gt;As it turns out, this is &lt;em&gt;also&lt;/em&gt; easy to do with syntax classes. We can add an extra attribute to our &lt;code&gt;type&lt;/code&gt; syntax class to generate a random identifier with each one. Again, we can use &lt;code&gt;#:attr&lt;/code&gt; to do that automatically. Our new definition for &lt;code&gt;type&lt;/code&gt; will look like this:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;begin-for-syntax&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-syntax-class&lt;/span&gt; &lt;span class="n"&gt;type&lt;/span&gt;
+    &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;pattern&lt;/span&gt; &lt;span class="n"&gt;name:id&lt;/span&gt;
+             &lt;span class="kd"&gt;#:attr&lt;/span&gt; &lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;param&lt;/span&gt; &lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt; &lt;span class="o"&gt;&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;()&lt;/span&gt;
+             &lt;span class="kd"&gt;#:attr&lt;/span&gt; &lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;field-id&lt;/span&gt; &lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt; &lt;span class="o"&gt;&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;())&lt;/span&gt;
+    &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;pattern&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;name:id&lt;/span&gt; &lt;span class="n"&gt;param&lt;/span&gt; &lt;span class="n"&gt;...+&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+             &lt;span class="kd"&gt;#:attr&lt;/span&gt; &lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;field-id&lt;/span&gt; &lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;generate-temporaries&lt;/span&gt; &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;param&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)))))&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;Here we&amp;rsquo;re using &lt;code&gt;generate-temporaries&lt;/code&gt; instead of &lt;code&gt;generate-temporary&lt;/code&gt;, which will conveniently generate a new identifier for each of the elements in the list we provide it. This way, we&amp;rsquo;ll get a fresh identifier for each &lt;code&gt;param&lt;/code&gt;.&lt;/p&gt;
+
+&lt;p&gt;We can now fix our macro to use this &lt;code&gt;field-id&lt;/code&gt; attribute instead of the static field name:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;begin&lt;/span&gt;
+    &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;struct&lt;/span&gt; &lt;span class="n"&gt;data-constructor.name&lt;/span&gt;
+      &lt;span class="p"&gt;([&lt;/span&gt;&lt;span class="n"&gt;data-constructor.field-id&lt;/span&gt; &lt;span class="n"&gt;:&lt;/span&gt; &lt;span class="n"&gt;data-constructor.param&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+    &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;h2 id="creating-the-supertype"&gt;Creating the supertype&lt;/h2&gt;
+
+&lt;p&gt;We&amp;rsquo;re almost done—now we just need to implement our overall type, the one defined by &lt;code&gt;type-name&lt;/code&gt;. This is implemented as a trivial type alias, but we need to ensure that polymorphic types are properly handled. For example, a non-polymorphic type would need to be handled like this:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-type&lt;/span&gt; &lt;span class="n"&gt;Tree&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;U&lt;/span&gt; &lt;span class="n"&gt;Empty&lt;/span&gt; &lt;span class="n"&gt;Leaf&lt;/span&gt; &lt;span class="n"&gt;Node&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;However, a polymorphic type alias would need to include the type parameters in each subtype, like this:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-type&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Tree&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;U&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Empty&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Leaf&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Node&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;)))&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;How can we do this? Well, so far, we&amp;rsquo;ve been very declarative by using syntax patterns, templates, and classes. However, this is a more pernicious problem to solve with our declarative tools. Fortunately, it&amp;rsquo;s very easy to fall back to using &lt;strong&gt;procedural macros&lt;/strong&gt;.&lt;/p&gt;
+
+&lt;p&gt;To build each properly-instantiated type, we&amp;rsquo;ll use a combination of &lt;code&gt;define/with-syntax&lt;/code&gt; and Racket&amp;rsquo;s list comprehensions, &lt;code&gt;for/list&lt;/code&gt;. The &lt;code&gt;define/with-syntax&lt;/code&gt; form binds values to pattern identifiers, which can be used within syntax patterns just like the ones bound by &lt;code&gt;syntax-parser&lt;/code&gt;. This will allow us to break up our result into multiple steps. Technically, &lt;code&gt;define/with-syntax&lt;/code&gt; is not strictly necessary—we could just use &lt;code&gt;#`&lt;/code&gt; and &lt;code&gt;#,&lt;/code&gt;—but it&amp;rsquo;s cleaner to work with.&lt;/p&gt;
+
+&lt;p&gt;We&amp;rsquo;ll start by defining a set of instantiated data constructor types, one per &lt;code&gt;data-constructor&lt;/code&gt;:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define/with-syntax&lt;/span&gt; &lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;data-type&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;for/list&lt;/span&gt; &lt;span class="p"&gt;([&lt;/span&gt;&lt;span class="n"&gt;name&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;in-syntax&lt;/span&gt; &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;data-constructor.name&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;))])&lt;/span&gt;
+    &lt;span class="p"&gt;))&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;Now we can fill in the body with any code we&amp;rsquo;d like, so long as each body returns a syntax object. We can use some trivial branching logic to determine which form we need:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define/with-syntax&lt;/span&gt; &lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;data-type&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;for/list&lt;/span&gt; &lt;span class="p"&gt;([&lt;/span&gt;&lt;span class="n"&gt;name&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;in-syntax&lt;/span&gt; &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;data-constructor.name&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;))])&lt;/span&gt;
+    &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;if&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;stx-null?&lt;/span&gt; &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;type-name.param&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+        &lt;span class="n"&gt;name&lt;/span&gt;
+        &lt;span class="o"&gt;#`&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="o"&gt;#,&lt;/span&gt;&lt;span class="n"&gt;name&lt;/span&gt; &lt;span class="n"&gt;type-name.param&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;))))&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;Now with our definition for &lt;code&gt;data-type&lt;/code&gt;, we can implement our type alias for the supertype extremely easily:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-type&lt;/span&gt; &lt;span class="n"&gt;type-name&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;U&lt;/span&gt; &lt;span class="n"&gt;data-type&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;h2 id="putting-it-all-together"&gt;Putting it all together&lt;/h2&gt;
+
+&lt;p&gt;There&amp;rsquo;s just one more thing to do before we can call this macro finished: we need to ensure that all the type parameters defined by &lt;code&gt;type-name&lt;/code&gt; are in scope for each data constructor&amp;rsquo;s structure definition. We can do this by making use of &lt;code&gt;type-name.param&lt;/code&gt; within each produced struct definition, resulting in this:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;begin&lt;/span&gt;
+    &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;struct&lt;/span&gt; &lt;span class="n"&gt;data-constructor.name&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;type-name.param&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+      &lt;span class="p"&gt;([&lt;/span&gt;&lt;span class="n"&gt;data-constructor.field-id&lt;/span&gt; &lt;span class="n"&gt;:&lt;/span&gt; &lt;span class="n"&gt;data-constructor.param&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+    &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;And we&amp;rsquo;re done! The final macro, now completed, looks like this:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;begin-for-syntax&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-syntax-class&lt;/span&gt; &lt;span class="n"&gt;type&lt;/span&gt;
+    &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;pattern&lt;/span&gt; &lt;span class="n"&gt;name:id&lt;/span&gt;
+             &lt;span class="kd"&gt;#:attr&lt;/span&gt; &lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;param&lt;/span&gt; &lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt; &lt;span class="o"&gt;&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;()&lt;/span&gt;
+             &lt;span class="kd"&gt;#:attr&lt;/span&gt; &lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;field-id&lt;/span&gt; &lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt; &lt;span class="o"&gt;&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;())&lt;/span&gt;
+    &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;pattern&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;name:id&lt;/span&gt; &lt;span class="n"&gt;param&lt;/span&gt; &lt;span class="n"&gt;...+&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+             &lt;span class="kd"&gt;#:attr&lt;/span&gt; &lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;field-id&lt;/span&gt; &lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;generate-temporaries&lt;/span&gt; &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;param&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)))))&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;define-syntax&lt;/span&gt; &lt;span class="n"&gt;define-datatype&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;syntax-parser&lt;/span&gt;
+    &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="k"&gt;_&lt;/span&gt; &lt;span class="n"&gt;type-name:type&lt;/span&gt; &lt;span class="n"&gt;data-constructor:type&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+
+     &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define/with-syntax&lt;/span&gt; &lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;data-type&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt;
+       &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;for/list&lt;/span&gt; &lt;span class="p"&gt;([&lt;/span&gt;&lt;span class="n"&gt;name&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;in-syntax&lt;/span&gt; &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;data-constructor.name&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;))])&lt;/span&gt;
+         &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;if&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;stx-null?&lt;/span&gt; &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;type-name.param&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+             &lt;span class="n"&gt;name&lt;/span&gt;
+             &lt;span class="o"&gt;#`&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="o"&gt;#,&lt;/span&gt;&lt;span class="n"&gt;name&lt;/span&gt; &lt;span class="n"&gt;type-name.param&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;))))&lt;/span&gt;
+
+     &lt;span class="o"&gt;#&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;begin&lt;/span&gt;
+         &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;struct&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;type-name.param&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="n"&gt;data-constructor.name&lt;/span&gt;
+           &lt;span class="p"&gt;([&lt;/span&gt;&lt;span class="n"&gt;data-constructor.field-id&lt;/span&gt; &lt;span class="n"&gt;:&lt;/span&gt; &lt;span class="n"&gt;data-constructor.param&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;
+         &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-type&lt;/span&gt; &lt;span class="n"&gt;type-name&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;U&lt;/span&gt; &lt;span class="n"&gt;data-type&lt;/span&gt; &lt;span class="k"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)))]))&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;It&amp;rsquo;s a little bit dense, certainly, but it is not as complicated or scary as it might seem. It&amp;rsquo;s a simple, mostly declarative, powerful way to transform a DSL into ordinary Typed Racket syntax, and now all we have to do is put it to use.&lt;/p&gt;
+
+&lt;h1 id="using-our-adts"&gt;Using our ADTs&lt;/h1&gt;
+
+&lt;p&gt;With the macro built, we can now actually use our ADTs using the syntax we described! The following is now &lt;em&gt;valid code&lt;/em&gt;:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-datatype&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Tree&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+  &lt;span class="n"&gt;Empty&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Leaf&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Node&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Tree&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Tree&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;)))&lt;/span&gt;
+
+&lt;span class="nb"&gt;&amp;gt;&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Node&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Leaf&lt;/span&gt; &lt;span class="mi"&gt;3&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Node&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Empty&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Leaf&lt;/span&gt; &lt;span class="mi"&gt;7&lt;/span&gt;&lt;span class="p"&gt;)))&lt;/span&gt;
+&lt;span class="nb"&gt;-&lt;/span&gt; &lt;span class="n"&gt;:&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Node&lt;/span&gt; &lt;span class="n"&gt;Positive-Byte&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Node&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Leaf&lt;/span&gt; &lt;span class="mi"&gt;3&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Node&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Empty&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Leaf&lt;/span&gt; &lt;span class="mi"&gt;7&lt;/span&gt;&lt;span class="p"&gt;)))&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;We can use this to define common data types, such as Haskell&amp;rsquo;s &lt;code&gt;Maybe&lt;/code&gt;:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-datatype&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Maybe&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Just&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+  &lt;span class="n"&gt;Nothing&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;:&lt;/span&gt; &lt;span class="n"&gt;maybe-default&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;All&lt;/span&gt; &lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Maybe&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt; &lt;span class="k"&gt;-&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;define&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;maybe-default&lt;/span&gt; &lt;span class="n"&gt;m&lt;/span&gt; &lt;span class="n"&gt;v&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;match&lt;/span&gt; &lt;span class="n"&gt;m&lt;/span&gt;
+    &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="n"&gt;Just&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;  &lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt;
+    &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="n"&gt;Nothing&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="n"&gt;v&lt;/span&gt;&lt;span class="p"&gt;]))&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;:&lt;/span&gt; &lt;span class="n"&gt;maybe-then&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;All&lt;/span&gt; &lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Maybe&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;a&lt;/span&gt; &lt;span class="k"&gt;-&amp;gt;&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Maybe&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt; &lt;span class="k"&gt;-&amp;gt;&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Maybe&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;)))&lt;/span&gt;
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;define&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;maybe-then&lt;/span&gt; &lt;span class="n"&gt;m&lt;/span&gt; &lt;span class="n"&gt;f&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;match&lt;/span&gt; &lt;span class="n"&gt;m&lt;/span&gt;
+    &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="n"&gt;Just&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;f&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;)]&lt;/span&gt;
+    &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="n"&gt;Nothing&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Nothing&lt;/span&gt;&lt;span class="p"&gt;)]))&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;And of course, we can also use it to define ADTs that use concrete types rather that type parameters, if we so desire. This implements a small mathematical language, along with a trivial interpreter:&lt;/p&gt;
+
+&lt;div class="brush: racket"&gt;
+ &lt;div class="source"&gt;
+  &lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;define-datatype&lt;/span&gt; &lt;span class="n"&gt;Expr&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Value&lt;/span&gt; &lt;span class="n"&gt;Number&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Add&lt;/span&gt; &lt;span class="n"&gt;Expr&lt;/span&gt; &lt;span class="n"&gt;Expr&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Subtract&lt;/span&gt; &lt;span class="n"&gt;Expr&lt;/span&gt; &lt;span class="n"&gt;Expr&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Multiply&lt;/span&gt; &lt;span class="n"&gt;Expr&lt;/span&gt; &lt;span class="n"&gt;Expr&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Divide&lt;/span&gt; &lt;span class="n"&gt;Expr&lt;/span&gt; &lt;span class="n"&gt;Expr&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;:&lt;/span&gt; &lt;span class="n"&gt;evaluate&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Expr&lt;/span&gt; &lt;span class="k"&gt;-&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;Number&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;define&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;evaluate&lt;/span&gt; &lt;span class="n"&gt;e&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+  &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;match&lt;/span&gt; &lt;span class="n"&gt;e&lt;/span&gt;
+    &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="n"&gt;Value&lt;/span&gt; &lt;span class="n"&gt;x&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;      &lt;span class="n"&gt;x&lt;/span&gt;                            &lt;span class="p"&gt;]&lt;/span&gt;
+    &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="n"&gt;Add&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt; &lt;span class="n"&gt;b&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;      &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;+&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;evaluate&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;evaluate&lt;/span&gt; &lt;span class="n"&gt;b&lt;/span&gt;&lt;span class="p"&gt;))]&lt;/span&gt;
+    &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="n"&gt;Subtract&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt; &lt;span class="n"&gt;b&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;-&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;evaluate&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;evaluate&lt;/span&gt; &lt;span class="n"&gt;b&lt;/span&gt;&lt;span class="p"&gt;))]&lt;/span&gt;
+    &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="n"&gt;Multiply&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt; &lt;span class="n"&gt;b&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;*&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;evaluate&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;evaluate&lt;/span&gt; &lt;span class="n"&gt;b&lt;/span&gt;&lt;span class="p"&gt;))]&lt;/span&gt;
+    &lt;span class="p"&gt;[(&lt;/span&gt;&lt;span class="n"&gt;Divide&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt; &lt;span class="n"&gt;b&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;   &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;/&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;evaluate&lt;/span&gt; &lt;span class="n"&gt;a&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;evaluate&lt;/span&gt; &lt;span class="n"&gt;b&lt;/span&gt;&lt;span class="p"&gt;))]))&lt;/span&gt;
+
+&lt;span class="nb"&gt;&amp;gt;&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;evaluate&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Add&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Value&lt;/span&gt; &lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+                 &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Multiply&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Divide&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Value&lt;/span&gt; &lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Value&lt;/span&gt; &lt;span class="mi"&gt;2&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+                           &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Value&lt;/span&gt; &lt;span class="mi"&gt;7&lt;/span&gt;&lt;span class="p"&gt;))))&lt;/span&gt;
+&lt;span class="mi"&gt;4&lt;/span&gt; &lt;span class="m"&gt;1/2&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;p&gt;There&amp;rsquo;s all the power of ADTs, right in Racket, all implemented in 22 lines of code. If you&amp;rsquo;d like to see all the code together in a runnable form, &lt;a href="https://gist.github.com/lexi-lambda/18cf7a9156f743a1317e"&gt;I&amp;rsquo;ve put together a gist here&lt;/a&gt;.&lt;/p&gt;
+
+&lt;h1 id="conclusions-and-credit"&gt;Conclusions and credit&lt;/h1&gt;
+
+&lt;p&gt;This isn&amp;rsquo;t the simplest macro to create, nor is it the most complex. The code examples might not even make much sense until you try it out yourself. Macros, like any difficult concept, are not always easy to pick up, but they certainly &lt;em&gt;are&lt;/em&gt; powerful. The ability to extend the language in such a way, in the matter of minutes, is unparalleled in languages other than Lisp.&lt;/p&gt;
+
+&lt;p&gt;This is, of course, a blessing and a curse. Lisps reject some of the syntactic landmarks that often aid in readability for the power to abstract programs into their bare components. In the end, is this uniform conciseness more or less readable? That&amp;rsquo;s an incredibly subjective question, one that has prompted powerfully impassioned discussions, and I will not attempt to argue one way or the other here.&lt;/p&gt;
+
+&lt;p&gt;That said, I think it&amp;rsquo;s pretty cool.&lt;/p&gt;
+
+&lt;p&gt;Finally, I must give credit where credit is due. Thanks to &lt;a href="http://andmkent.com"&gt;Andrew M. Kent&lt;/a&gt; for the creation of the &lt;a href="https://github.com/andmkent/datatype"&gt;datatype&lt;/a&gt; package, which served as the inspiration for this blog post. Many thanks to &lt;a href="http://www.ccs.neu.edu/home/samth/"&gt;Sam Tobin-Hochstadt&lt;/a&gt; for his work creating Typed Racket, as well as helping me dramatically simplify the implementation used in this blog post. Also thanks to &lt;a href="http://www.ccs.neu.edu/home/ryanc/"&gt;Ryan Culpepper&lt;/a&gt; and &lt;a href="http://www.ccs.neu.edu/home/matthias/"&gt;Matthias Felleisen&lt;/a&gt; for their work on creating &lt;code&gt;syntax/parse&lt;/code&gt;, which is truly a marvelous tool for exploring the world of macros, and, of course, a big thanks to &lt;a href="http://www.cs.utah.edu/~mflatt/"&gt;Matthew Flatt&lt;/a&gt; for his implementation of hygiene in Racket, as well as much of the rest of Racket itself. Not to mention the entire legacy of those who formulated the foundations of the Scheme macro system and created the framework for all of this to be possible so many decades later.&lt;/p&gt;
+
+&lt;p&gt;Truly, working in Racket feels like standing on the shoulders of giants. If you&amp;rsquo;re intrigued, give it a shot. It&amp;rsquo;s a fun feeling.&lt;/p&gt;</description></item></channel></rss>
